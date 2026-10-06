@@ -1,8 +1,10 @@
 # Year 7 Class Role Bot
 
 A Discord bot that asks for your school email, checks it against the class roster
-(`the final data(Sheet1).csv`) and — if it matches — gives you the Discord role for
-your class (7A–7R).
+(`db.csv`) and — if it matches — gives you the Discord role for your class (7A–7R).
+
+Runs on **Node.js ≥ 22.18** (TypeScript is executed natively via built-in type
+stripping — no bundler or transpiler involved).
 
 ## How it works
 
@@ -25,7 +27,7 @@ No privileged intents are needed (the bot only reads interactions), so leave
 
 ### 2. Start the bot
 
-The preview commands are already saved (`bun install`, `bun run dev` on port 3000).
+The preview commands are already saved (`npm install`, `npm run dev` on port 3000).
 Start the preview and read the logs:
 
 ```
@@ -52,7 +54,7 @@ Run `/verify`, type the school email, and the class role is applied.
 | What | Where |
 | --- | --- |
 | Class → role ID mapping (7A–7R) | `src/roles.ts` |
-| Student roster | `the final data(Sheet1).csv` (columns: First Name, Last Name, Gender, Class, Email Address, School, Year) |
+| Student roster | `db.csv` (columns: First Name, Last Name, Gender, Class, Email Address, School, Year) |
 | Roster path override | `ROSTER_CSV` env var |
 
 The roster is re-read from disk on every verification, so adding or fixing a student in
@@ -63,10 +65,10 @@ class with no configured role get a clear "ask an admin" message.
 ## Scripts
 
 ```
-bun install       # dependencies
-bun run dev       # run the bot
-bun test          # roster + verification tests against the real CSV
-bun run typecheck # tsc --noEmit
+npm install       # dependencies
+npm run dev       # run the bot (node src/bot.ts)
+npm test          # roster + verification tests (node --test) against the real CSV
+npm run typecheck # tsc --noEmit
 ```
 
 ## Troubleshooting

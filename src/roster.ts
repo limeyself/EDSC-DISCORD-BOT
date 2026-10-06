@@ -11,10 +11,7 @@ export interface RosterEntry {
 /** Repo root, derived from this file's location (src/roster.ts). */
 const REPO_ROOT = resolve(fileURLToPath(new URL("../", import.meta.url)));
 
-export const DEFAULT_ROSTER_PATH = resolve(
-  REPO_ROOT,
-  "the final data(Sheet1).csv",
-);
+export const DEFAULT_ROSTER_PATH = resolve(REPO_ROOT, "db.csv");
 
 /** Loose email shape check: something@something.tld with no spaces. */
 const EMAIL_PATTERN = /^[^\s@,;]+@[^\s@,;]+\.[^\s@,;]+$/;

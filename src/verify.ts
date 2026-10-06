@@ -1,6 +1,6 @@
-import { loadRoster, looksLikeEmail, normalizeEmail } from "./roster";
-import type { RosterEntry } from "./roster";
-import { CLASS_ROLE_IDS } from "./roles";
+import { loadRoster, looksLikeEmail, normalizeEmail } from "./roster.ts";
+import type { RosterEntry } from "./roster.ts";
+import { CLASS_ROLE_IDS } from "./roles.ts";
 
 export type VerifyResult =
   /** Email is on the roster and the class has a Discord role. */

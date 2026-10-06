@@ -1,44 +1,47 @@
-import { describe, expect, test } from "bun:test";
+import assert from "node:assert/strict";
+import { describe, test } from "node:test";
 import {
   DEFAULT_ROSTER_PATH,
   loadRoster,
   looksLikeEmail,
   normalizeEmail,
   parseRoster,
-} from "./roster";
-import { CLASS_ROLE_IDS, SECTION_ROLE_IDS } from "./roles";
-import { verifyEmail } from "./verify";
+} from "./roster.ts";
+import { CLASS_ROLE_IDS, SECTION_ROLE_IDS } from "./roles.ts";
+import { verifyEmail } from "./verify.ts";
 
 describe("class role config", () => {
   test("has a role for every class 7A-7R, all unique snowflakes", () => {
     const classes = Object.keys(CLASS_ROLE_IDS).sort();
-    expect(classes).toEqual([
+    assert.deepStrictEqual(classes, [
       "7A", "7B", "7C", "7D", "7E", "7F", "7G", "7H", "7I",
       "7J", "7K", "7L", "7M", "7N", "7O", "7P", "7Q", "7R",
     ]);
 
     const ids = Object.values(CLASS_ROLE_IDS);
-    for (const id of ids) expect(id).toMatch(/^\d{17,20}$/);
-    expect(new Set(ids).size).toBe(ids.length);
-    expect(SECTION_ROLE_IDS.size).toBe(ids.length);
+    for (const id of ids) assert.match(id, /^\d{17,20}$/);
+    assert.equal(new Set(ids).size, ids.length);
+    assert.equal(SECTION_ROLE_IDS.size, ids.length);
   });
 });
 
 describe("email normalization", () => {
   test("lowercases and strips whitespace", () => {
-    expect(normalizeEmail("  ZABBI@schools.vic.edu.au  ")).toBe(
+    assert.equal(
+      normalizeEmail("  ZABBI@schools.vic.edu.au  "),
       "zabbi@schools.vic.edu.au",
     );
-    expect(normalizeEmail("zabbi @schools .vic.edu.au")).toBe(
+    assert.equal(
+      normalizeEmail("zabbi @schools .vic.edu.au"),
       "zabbi@schools.vic.edu.au",
     );
   });
 
   test("rejects things that are not emails", () => {
-    expect(looksLikeEmail("")).toBe(false);
-    expect(looksLikeEmail("not-an-email")).toBe(false);
-    expect(looksLikeEmail("zabbi@schools")).toBe(false);
-    expect(looksLikeEmail("zabbi@schools.vic.edu.au")).toBe(true);
+    assert.equal(looksLikeEmail(""), false);
+    assert.equal(looksLikeEmail("not-an-email"), false);
+    assert.equal(looksLikeEmail("zabbi@schools"), false);
+    assert.equal(looksLikeEmail("zabbi@schools.vic.edu.au"), true);
   });
 });
 
@@ -52,8 +55,8 @@ describe("roster parsing", () => {
     ].join("\n");
 
     const roster = parseRoster(csv);
-    expect(roster.size).toBe(1);
-    expect(roster.get("zabbi@schools.vic.edu.au")).toEqual({
+    assert.equal(roster.size, 1);
+    assert.deepStrictEqual(roster.get("zabbi@schools.vic.edu.au"), {
       firstName: "Zaynab",
       lastName: "Abbas",
       className: "7J",
@@ -62,55 +65,62 @@ describe("roster parsing", () => {
 
   test("loads the real roster from disk", () => {
     const roster = loadRoster(DEFAULT_ROSTER_PATH);
-    expect(roster.size).toBe(395);
+    assert.equal(roster.size, 395);
 
     // Spot-check the first row of the sheet.
     const entry = roster.get("zabbi@schools.vic.edu.au");
-    expect(entry?.className).toBe("7J");
-    expect(entry?.firstName).toBe("Zaynab");
+    assert.equal(entry?.className, "7J");
+    assert.equal(entry?.firstName, "Zaynab");
 
     // Every student on the roster must map to a configured class role.
     for (const [email, student] of roster) {
-      expect(CLASS_ROLE_IDS[student.className]).toBeDefined();
-      expect(email).toMatch(/^[^\s@]+@[^\s@]+\.[^\s@]+$/);
-      expect(student.className).toMatch(/^7[A-R]$/);
+      assert.ok(
+        CLASS_ROLE_IDS[student.className],
+        `no role configured for class ${student.className}`,
+      );
+      assert.match(email, /^[^\s@]+@[^\s@]+\.[^\s@]+$/);
+      assert.match(student.className, /^7[A-R]$/);
     }
 
     // No duplicate addresses anywhere on the sheet.
-    expect(new Set(roster.keys()).size).toBe(roster.size);
+    assert.equal(new Set(roster.keys()).size, roster.size);
   });
 });
 
 describe("verifyEmail", () => {
   test("resolves a real student to their class role", () => {
     const result = verifyEmail("ZABBI@schools.vic.edu.au");
-    expect(result.status).toBe("ok");
+    assert.equal(result.status, "ok");
     if (result.status === "ok") {
-      expect(result.entry.className).toBe("7J");
-      expect(result.roleId).toBe("1446218992439267348");
+      assert.equal(result.entry.className, "7J");
+      assert.equal(result.roleId, "1446218992439267348");
     }
   });
 
   test("is tolerant of case and stray spaces", () => {
-    expect(verifyEmail("  zabbi@schools.vic.edu.au ").status).toBe("ok");
+    assert.equal(verifyEmail("  zabbi@schools.vic.edu.au ").status, "ok");
   });
 
   test("rejects malformed input", () => {
-    expect(verifyEmail("not an email").status).toBe("invalid_email");
-    expect(verifyEmail("").status).toBe("invalid_email");
+    assert.equal(verifyEmail("not an email").status, "invalid_email");
+    assert.equal(verifyEmail("").status, "invalid_email");
   });
 
   test("rejects emails that are not on the roster", () => {
-    expect(verifyEmail("nobody@schools.vic.edu.au").status).toBe("not_found");
-    expect(verifyEmail("someone@example.com").status).toBe("not_found");
+    assert.equal(verifyEmail("nobody@schools.vic.edu.au").status, "not_found");
+    assert.equal(verifyEmail("someone@example.com").status, "not_found");
   });
 
   test("every class on the roster has a matching role", () => {
     const roster = loadRoster(DEFAULT_ROSTER_PATH);
     const classes = new Set([...roster.values()].map((s) => s.className));
-    expect(classes.size).toBe(18);
+    assert.equal(classes.size, 18);
     for (const className of classes) {
-      expect(SECTION_ROLE_IDS.has(CLASS_ROLE_IDS[className])).toBe(true);
+      assert.ok(
+        CLASS_ROLE_IDS[className],
+        `no role configured for class ${className}`,
+      );
+      assert.ok(SECTION_ROLE_IDS.has(CLASS_ROLE_IDS[className]));
     }
   });
 });

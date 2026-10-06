@@ -13,10 +13,10 @@ import {
   type Interaction,
   type ModalSubmitInteraction,
 } from "discord.js";
-import { startHealthServer } from "./health";
-import { loadRoster, rosterPath } from "./roster";
-import { SECTION_ROLE_IDS } from "./roles";
-import { verifyEmail } from "./verify";
+import { startHealthServer } from "./health.ts";
+import { loadRoster, rosterPath } from "./roster.ts";
+import { SECTION_ROLE_IDS } from "./roles.ts";
+import { verifyEmail } from "./verify.ts";
 
 const MODAL_ID = "verify:email";
 const EMAIL_FIELD_ID = "email";
