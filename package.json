@@ -10,11 +10,12 @@
   "scripts": {
     "dev": "node src/bot.ts",
     "start": "node src/bot.ts",
-    "test": "node --test src/roster.test.ts",
+    "test": "node --test src/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "discord.js": "^14.27.0"
+    "discord.js": "^14.27.0",
+    "redis": "^6.3.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

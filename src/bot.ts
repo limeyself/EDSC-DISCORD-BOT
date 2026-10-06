@@ -16,15 +16,21 @@ import {
 import { startHealthServer } from "./health.ts";
 import { loadRoster, rosterPath } from "./roster.ts";
 import { SECTION_ROLE_IDS } from "./roles.ts";
+import { decideVerification, store, type VerifyRecord } from "./store.ts";
 import { verifyEmail } from "./verify.ts";
 
 const MODAL_ID = "verify:email";
 const EMAIL_FIELD_ID = "email";
 const COOLDOWN_MS = 5_000;
 
+/** Same answer for both "another user already used this email" and "there is no data for it". */
+const MANUAL_REVIEW_MESSAGE =
+  "A user has already used this email address, or I have no data for it — you may need a manual review from a server admin.";
+const STORAGE_DOWN_MESSAGE =
+  "I can't reach the verification store right now — please try again in a minute.";
+
 const startedAt = Date.now();
 const state = {
-  ok: false,
   gateway: "starting",
   detail: "Starting up…",
   rosterEntries: 0,
@@ -32,7 +38,17 @@ const state = {
 };
 
 // Readiness endpoint runs first so it can report misconfiguration instead of hanging.
-startHealthServer(() => ({ ...state }));
+// The preview is only "ready" once BOTH the Discord gateway and Redis are up.
+startHealthServer(() => {
+  const redis = store.statusInfo();
+  return {
+    ...state,
+    redis: redis.status,
+    redisDetail: redis.detail,
+    ok: state.gateway === "ready" && redis.status === "ready",
+  };
+});
+void store.start();
 
 const lastAttemptByUser = new Map<string, number>();
 
@@ -46,7 +62,6 @@ if (!token) {
 } else {
   void startBot(token).catch((error) => {
     state.gateway = "error";
-    state.ok = false;
     state.detail = error instanceof Error ? error.message : String(error);
     console.error(`[bot] failed to start: ${state.detail}`);
   });
@@ -61,7 +76,6 @@ async function startBot(botToken: string): Promise<void> {
 
   client.once(Events.ClientReady, (ready) => {
     state.gateway = "ready";
-    state.ok = true;
     state.detail = `Logged in as ${ready.user.tag}`;
 
     try {
@@ -70,7 +84,6 @@ async function startBot(botToken: string): Promise<void> {
         `[bot] roster loaded: ${state.rosterEntries} students from ${rosterPath()}`,
       );
     } catch (error) {
-      state.ok = false;
       state.detail = `Could not read the roster CSV: ${
         error instanceof Error ? error.message : String(error)
       }`;
@@ -152,8 +165,10 @@ async function handleVerifyModal(interaction: ModalSubmitInteraction): Promise<v
       return;
 
     case "not_found":
+      // "Their data is not there" → the same manual-review answer as a claimed email.
+      console.log(`[bot] ${interaction.user.tag} submitted an address with no roster data`);
       await interaction.reply({
-        content: `I couldn't find \`${submitted.trim().replace(/`/g, "")}\` on the class list. Check for a typo and run \`/verify\` again.`,
+        content: MANUAL_REVIEW_MESSAGE,
         flags: MessageFlags.Ephemeral,
       });
       return;
@@ -166,18 +181,127 @@ async function handleVerifyModal(interaction: ModalSubmitInteraction): Promise<v
       return;
 
     case "ok":
-      await assignClassRole(interaction, result.entry.className, result.roleId);
+      await completeVerification(
+        interaction,
+        result.email,
+        result.entry.className,
+        result.roleId,
+      );
       return;
   }
 }
 
+/**
+ * Full verification pipeline: check the Redis registry, claim the email if it
+ * is free, grant the class role, then persist the record.
+ */
+async function completeVerification(
+  interaction: ModalSubmitInteraction,
+  email: string,
+  className: string,
+  roleId: string,
+): Promise<void> {
+  const record: VerifyRecord = {
+    userId: interaction.user.id,
+    userTag: interaction.user.tag,
+    email,
+    className,
+    verifiedAt: new Date().toISOString(),
+  };
+
+  let stored: VerifyRecord | null;
+  try {
+    stored = await store.getRecord(email);
+  } catch {
+    await interaction.reply({
+      content: STORAGE_DOWN_MESSAGE,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const decision = decideVerification(stored, interaction.user.id);
+  if (decision === "taken") {
+    console.log(
+      `[bot] ${interaction.user.tag} submitted an email already claimed by another user`,
+    );
+    await interaction.reply({
+      content: MANUAL_REVIEW_MESSAGE,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  let claimedNow = false;
+  if (decision === "free") {
+    try {
+      const claimed = await store.claim(record);
+      if (claimed) {
+        claimedNow = true;
+      } else {
+        // Lost the race: someone claimed this email while we were checking.
+        const current = await store.getRecord(email);
+        if (current && current.userId !== interaction.user.id) {
+          console.log(
+            `[bot] ${interaction.user.tag} submitted an email already claimed by another user`,
+          );
+          await interaction.reply({
+            content: MANUAL_REVIEW_MESSAGE,
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+      }
+    } catch {
+      await interaction.reply({
+        content: STORAGE_DOWN_MESSAGE,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+  }
+
+  const granted = await assignClassRole(interaction, className, roleId);
+  if (!granted) {
+    if (claimedNow) {
+      // Don't burn the email on a failed grant — roll the claim back.
+      await store.release(record).catch((error: unknown) => {
+        console.error(
+          `[redis] could not roll back claim: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      });
+    }
+    return;
+  }
+
+  if (!claimedNow) {
+    // Re-verification by the same user: refresh the stored record.
+    await store.refresh(record).catch((error: unknown) => {
+      console.error(
+        `[redis] could not refresh record: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    });
+  }
+
+  console.log(`[bot] verified ${interaction.user.tag} -> ${className}`);
+  await interaction.reply({
+    content: `Verified ✅ You now have the **${className}** class role.`,
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+/** Grants the class role. Returns false after replying with the reason. */
 async function assignClassRole(
   interaction: ModalSubmitInteraction,
   className: string,
   roleId: string,
-): Promise<void> {
+): Promise<boolean> {
   const guild = interaction.guild;
-  if (!guild) return;
+  if (!guild) return false;
 
   const member =
     interaction.member instanceof GuildMember
@@ -205,15 +329,10 @@ async function assignClassRole(
       content: describeRoleError(error),
       flags: MessageFlags.Ephemeral,
     });
-    return;
+    return false;
   }
 
-  console.log(`[bot] verified ${interaction.user.tag} -> ${className}`);
-
-  await interaction.reply({
-    content: `Verified ✅ You now have the **${className}** class role.`,
-    flags: MessageFlags.Ephemeral,
-  });
+  return true;
 }
 
 function describeRoleError(error: unknown): string {

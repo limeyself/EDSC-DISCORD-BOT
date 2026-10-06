@@ -4,7 +4,7 @@ import { CLASS_ROLE_IDS } from "./roles.ts";
 
 export type VerifyResult =
   /** Email is on the roster and the class has a Discord role. */
-  | { status: "ok"; entry: RosterEntry; roleId: string }
+  | { status: "ok"; entry: RosterEntry; roleId: string; email: string }
   /** Input does not look like an email address at all. */
   | { status: "invalid_email" }
   /** Well-formed email, but not on the roster. */
@@ -27,5 +27,5 @@ export function verifyEmail(rawInput: string): VerifyResult {
   const roleId = CLASS_ROLE_IDS[entry.className];
   if (!roleId) return { status: "no_role", entry };
 
-  return { status: "ok", entry, roleId };
+  return { status: "ok", entry, roleId, email };
 }

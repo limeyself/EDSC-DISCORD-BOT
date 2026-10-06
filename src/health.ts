@@ -1,10 +1,12 @@
 import { createServer, type Server } from "node:http";
 
 export interface HealthState {
-  /** True only when the Discord gateway is connected and the roster loaded. */
+  /** True only when the Discord gateway AND Redis are both connected. */
   ok: boolean;
   gateway: string;
   detail?: string;
+  redis?: string;
+  redisDetail?: string;
   rosterEntries?: number;
   startedAt: number;
 }
