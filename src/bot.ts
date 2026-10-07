@@ -399,6 +399,35 @@ async function hasAdminRole(
 
 const ADMIN_ROLE_MESSAGE = `This is admin-only — you need the <@&${ADMIN_ROLE_ID}> role.`;
 
+/**
+ * DMs every member holding the admin role in a guild (reviewers). Returns how
+ * many were actually messaged — reviewers with DMs closed are skipped.
+ */
+async function notifyReviewers(guildId: string, content: string): Promise<number> {
+  try {
+    if (!botClient) return 0;
+    const guild = await botClient.guilds.fetch(guildId).catch(() => null);
+    if (!guild) return 0;
+    const members = await guild.members.fetch().catch(() => null);
+    if (!members) return 0;
+    const reviewers = members.filter(
+      (m) => m.roles.cache.has(ADMIN_ROLE_ID) && !m.user.bot,
+    );
+    let sent = 0;
+    for (const member of reviewers.values()) {
+      try {
+        await member.send(content);
+        sent += 1;
+      } catch {
+        // DMs closed — skip this reviewer.
+      }
+    }
+    return sent;
+  } catch {
+    return 0;
+  }
+}
+
 /** Melbourne-local time for review listings (invalid input → "—"). */
 function formatWhen(iso: string): string {
   const date = new Date(iso);
@@ -622,9 +651,21 @@ async function handleRosterMatch(
   console.log(
     `[bot] ${interaction.user.tag} requested a review for ${className}`,
   );
+  const notified = await notifyReviewers(
+    guildId,
+    `🔔 New verification review requested by **${interaction.user.tag}** for class **${className}**.\n` +
+      `Review it with \`/review list\` and \`/review approve user:${interaction.user.tag}\`.`,
+  );
+  if (notified === 0) {
+    console.warn(
+      `[review] no admin-role reviewers could be DMed for ${className}'s request`,
+    );
+  }
   await interaction.reply({
     content:
-      "Review requested ✅ An admin will check it with `/review list` and `/review approve` — you'll get a DM with your class server invite once you're approved.",
+      notified > 0
+        ? "Review requested ✅ The reviewers have been notified by DM — you'll get a DM with your class server invite once you're approved."
+        : "Review requested ✅ An admin will check it with `/review list` — you'll get a DM with your class server invite once you're approved.",
     flags: MessageFlags.Ephemeral,
   });
 }
@@ -1233,8 +1274,21 @@ async function handleServerRequestModal(
   console.log(
     `[request] ${interaction.user.tag} requested a server for ${className}`,
   );
+  const notified = await notifyReviewers(
+    interaction.guildId ?? "",
+    `🔔 **${interaction.user.tag}** requested a Discord server for class **${className}**: \`${serverId}\`${inviteInput ? " (invite attached)" : ""}.\n` +
+      `Approve with \`/server-request approve user:${interaction.user.tag}\`.`,
+  );
+  if (notified === 0) {
+    console.warn(
+      `[request] no admin-role reviewers could be DMed about ${className}'s server request`,
+    );
+  }
   await interaction.reply({
-    content: `Request in ✅ An admin will review it with \`/server-request list\` — you'll get a DM once the **${className}** server is added, then you can run \`/verify\`.`,
+    content:
+      notified > 0
+        ? `Request in ✅ The reviewers have been notified by DM — you'll get a DM once the **${className}** server is added, then you can run \`/verify\`.`
+        : `Request in ✅ An admin will review it with \`/server-request list\` — you'll get a DM once the **${className}** server is added, then you can run \`/verify\`.`,
     flags: MessageFlags.Ephemeral,
   });
 }
@@ -1575,8 +1629,11 @@ async function handleServerRequestCommand(
     try {
       const user = await botClient?.users.fetch(request.userId);
       await user?.send(
-        `Your request was approved ✅ The **${request.className}** server is set up — run \`/verify\` in the main server.` +
-          (appInvite ? `\n\nInvite the bot to the server (admins too): ${appInvite}` : ""),
+        botThere
+          ? `Your request was approved ✅ The **${request.className}** server is set up — run \`/verify\` in the main server.`
+          : `Your request was approved ✅ The **${request.className}** server is registered — **you now need to invite the bot to that server**:` +
+            (appInvite ? `\n\n${appInvite}` : "\n\n(the invite link is in the admin's reply — my logs weren't ready when you were messaged)") +
+            `\n\nOnce I'm in, run \`/verify\` in the main server.`,
       );
     } catch {
       // DMs closed — the admin reply carries the info instead.

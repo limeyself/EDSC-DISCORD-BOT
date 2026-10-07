@@ -27,8 +27,9 @@ stripping — no bundler or transpiler involved).
    claimed it, the student already has a review in flight, someone else holds their
    class's **server slot**, the class has no registered server, or the bot hasn't
    been invited there yet.
-4. Otherwise the bot **claims the class's server slot** and parks a pending review —
-   nothing is granted automatically.
+4. Otherwise the bot **claims the class's server slot**, parks a pending review —
+   nothing is granted automatically — and **DMs every reviewer** (members with the
+   admin role) so approvals don't wait on someone checking the channel.
 5. An admin runs `/review list`, then `/review approve user:@student` (or
    `/review deny`). Approval claims the email (`SET NX`), grants the class role in
    the main server, and DMs the student an invite link to their class server.
@@ -105,7 +106,9 @@ Rules: the class is derived from the submitted roster email, so students can
 only request **their own class**; a student can have only **one** open request;
 and a class that already has a server can't receive another (admins change that
 via `/class-server clear` instead). Admins can still bind servers directly with
-`/class-server set` at any time.
+`/class-server set` at any time. New requests **DM the reviewers** automatically,
+and an approval **DMs the student the bot-invite link** for that server whenever
+the bot isn't in it yet — joining it is the student's next step before `/verify`.
 
 ## Manual review & class servers
 
@@ -247,5 +250,6 @@ Messages lets it delete wrong numbers.
 | "Someone already holds the … server slot" | The class already has a student in review/approved — run `/review release class:<name>` to free it. |
 | "I don't have a server registered for …" / "I'm not in the … server" | Run `/class-server set` with the class server's ID and invite the bot to that server, then retry `/verify`. |
 | Approval says "couldn't DM them" | The student has DMs closed — relay the invite shown in the admin reply manually. |
+| Logs say "no admin-role reviewers could be DMed" | None of the admin-role members have DMs open (or nobody holds the role). Check `/review list` manually — the request still went through. |
 | "**7B** already has a server bound to it" (on /request or approve) | That class already has a server. An admin can `/class-server clear class:7B` first if it genuinely needs to change. |
 | "Your request for **7B** … is already waiting" | The student already has an open server request — wait for an admin's `/server-request approve` or `deny`. |
