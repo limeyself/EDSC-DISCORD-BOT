@@ -62,6 +62,7 @@ Run `/verify`, type the school email, and the class role is applied.
 | Student roster | `db.csv` (columns: First Name, Last Name, Gender, Class, Email Address, School, Year) |
 | Roster path override | `ROSTER_CSV` env var |
 | Claim registry | Redis at `redis://red-db2m8kvavr4c73ejq3g0:6379` (override: `REDIS_URL` env var) |
+| Verification panel access token (optional) | `PANEL_TOKEN` env var — when set, `/panel` requires `?token=<value>` |
 
 The roster is re-read from disk on every verification, so adding or fixing a student in
 the CSV takes effect immediately — no restart needed. Rows without a usable email
@@ -91,12 +92,34 @@ Claims are permanent and conflict-free by construction (`SET NX`): a second user
 the same address is told a user already used it and that manual review may be required. The
 bot reconnects every 15 s if Redis is down and reports its status on the health endpoint.
 
+## Verification panel
+
+The bot serves an admin panel at **`/panel`** on the same port as the health
+endpoint (the preview URL, or `http://localhost:3000/panel`). It shows:
+
+- status pills for the Discord gateway and Redis,
+- totals: verified students, classes represented, roster size, uptime,
+- one row per claim — Discord user, claimed email, class, and verification time
+  (Melbourne local time), newest first,
+- an amber banner with the underlying error if the Redis registry cannot be read
+  (the page never pretends the registry is empty when the store is down).
+
+The page auto-refreshes every 15 seconds. Every other path (including `/`)
+still returns the health JSON used for preview readiness.
+
+Because the panel lists student emails, set `PANEL_TOKEN` in Settings →
+Environment to require a `?token=` query parameter (`/panel?token=…`);
+requests without it get a plain 404. Without the token the panel is open to
+anyone with the preview URL.
+
 ## Troubleshooting
 
 | Symptom | Fix |
 | --- | --- |
 | Health endpoint says `DISCORD_BOT_TOKEN is not set` | Add the key in Settings → Environment, then `freebuff-preview restart`. |
 | Health endpoint says `"redis":"error"` (e.g. `ENOTFOUND`) | The bot can't resolve/reach the Redis host from where it runs. Point `REDIS_URL` at a Redis instance reachable from this workspace, then restart the preview. |
+| Panel shows "Could not read the verification store" | Same cause as above — the registry lives in Redis. Fix connectivity and reload `/panel`. |
+| `/panel` returns 404 while `/` returns health JSON | A `PANEL_TOKEN` is set. Open `/panel?token=<value>` instead. |
 | "I don't have permission to manage roles" (API 50013) | Move the bot's role above 7A–7R and make sure it has Manage Roles. |
 | `/verify` not listed | Wait for global command propagation (up to an hour) or re-invite; the bot re-registers on every start. |
 | "couldn't find ... on the class list" | Check the address against the roster CSV — matching is case-insensitive, domain included. |

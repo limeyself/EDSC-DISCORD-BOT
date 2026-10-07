@@ -143,6 +143,27 @@ export class VerifyStore {
     }
   }
 
+  /** Every verification record (used by the /panel page), capped at 1000. */
+  async listRecords(): Promise<VerifyRecord[]> {
+    const records: VerifyRecord[] = [];
+    for await (const keys of this.client.scanIterator({
+      MATCH: `${EMAIL_PREFIX}*`,
+      COUNT: 100,
+    })) {
+      for (const key of keys) {
+        const raw = await this.client.get(key);
+        if (!raw) continue;
+        try {
+          records.push(JSON.parse(raw) as VerifyRecord);
+        } catch {
+          // Skip an unreadable entry instead of failing the whole panel.
+        }
+      }
+      if (records.length >= 1000) break;
+    }
+    return records;
+  }
+
   async close(): Promise<void> {
     if (this.retryTimer) clearInterval(this.retryTimer);
     if (this.client.isOpen) await this.client.quit().catch(() => undefined);

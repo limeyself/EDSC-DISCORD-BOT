@@ -39,15 +39,28 @@ const state = {
 
 // Readiness endpoint runs first so it can report misconfiguration instead of hanging.
 // The preview is only "ready" once BOTH the Discord gateway and Redis are up.
-startHealthServer(() => {
-  const redis = store.statusInfo();
-  return {
-    ...state,
-    redis: redis.status,
-    redisDetail: redis.detail,
-    ok: state.gateway === "ready" && redis.status === "ready",
-  };
-});
+startHealthServer(
+  () => {
+    const redis = store.statusInfo();
+    return {
+      ...state,
+      redis: redis.status,
+      redisDetail: redis.detail,
+      ok: state.gateway === "ready" && redis.status === "ready",
+    };
+  },
+  async () => {
+    try {
+      return { records: await store.listRecords() };
+    } catch (error) {
+      const message =
+        (error instanceof Error ? error.message : String(error)).trim() ||
+        "the verification store is unreachable";
+      console.error(`[panel] could not list records: ${message}`);
+      return { records: null, recordsError: message };
+    }
+  },
+);
 void store.start();
 
 const lastAttemptByUser = new Map<string, number>();
