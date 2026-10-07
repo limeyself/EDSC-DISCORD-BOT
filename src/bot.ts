@@ -28,7 +28,9 @@ import { startHealthServer } from "./health.ts";
 import { loadRoster, rosterPath } from "./roster.ts";
 import {
   decideReviewRequest,
+  decideServerRequest,
   type PendingReview,
+  type ServerRequest,
 } from "./review.ts";
 import {
   ADMIN_ROLE_ID,
@@ -46,6 +48,7 @@ import { verifyEmail } from "./verify.ts";
 
 const MODAL_ID = "verify:email";
 const EMAIL_FIELD_ID = "email";
+const SERVER_REQUEST_MODAL_ID = "request:server";
 const COOLDOWN_MS = 5_000;
 
 /** Same answer for both "another user already used this email" and "there is no data for it". */
@@ -53,6 +56,8 @@ const MANUAL_REVIEW_MESSAGE =
   "A user has already used this email address, or I have no data for it — you may need a manual review from a server admin.";
 const STORAGE_DOWN_MESSAGE =
   "I can't reach the verification store right now — please try again in a minute.";
+
+const INVITE_PERMISSIONS = 1024 + 2048 + 65536 + 131072 + 268435456;
 
 const startedAt = Date.now();
 const state = {
@@ -189,8 +194,19 @@ async function handleInteraction(interaction: Interaction): Promise<void> {
       await handleReviewCommand(interaction);
     } else if (interaction.commandName === "class-server") {
       await handleClassServerCommand(interaction);
+    } else if (interaction.commandName === "request") {
+      await handleRequestCommand(interaction);
+    } else if (interaction.commandName === "server-request") {
+      await handleServerRequestCommand(interaction);
     }
     return;
+  }
+
+  if (
+    interaction.isModalSubmit() &&
+    interaction.customId === SERVER_REQUEST_MODAL_ID
+  ) {
+    await handleServerRequestModal(interaction);
   }
 
   if (interaction.isModalSubmit() && interaction.customId === MODAL_ID) {
@@ -1042,7 +1058,186 @@ async function sendApprovalDm(
   }
 }
 
-// ── Class servers: /class-server set | clear | list ─────────────────────
+// ── Student server requests: /request (student) + /server-request (admin) ──
+
+/**
+ * A student asks for their class's Discord server to be added: /request opens
+ * a modal for the server ID (and optional invite). An admin later approves it
+ * with /server-request approve, which binds the class and unlocks reviews.
+ */
+async function handleRequestCommand(
+  interaction: ChatInputCommandInteraction,
+): Promise<void> {
+  if (!interaction.inGuild()) {
+    await interaction.reply({
+      content: "Please run `/request` inside the server.",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  // Server IDs need Developer Mode to copy — tell them how up front.
+  await interaction.showModal(
+    new ModalBuilder()
+      .setCustomId(SERVER_REQUEST_MODAL_ID)
+      .setTitle("Add your class's server")
+      .addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("server_id")
+            .setLabel("The class server's ID")
+            .setPlaceholder("Right-click the server → Copy Server ID")
+            .setStyle(TextInputStyle.Short)
+            .setMinLength(17)
+            .setMaxLength(20)
+            .setRequired(true),
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("server_invite")
+            .setLabel("Invite link to that server (optional)")
+            .setPlaceholder("https://discord.gg/… (recommended)")
+            .setStyle(TextInputStyle.Short)
+            .setMaxLength(80)
+            .setRequired(false),
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId(EMAIL_FIELD_ID)
+            .setLabel("Your school email (proof of class)")
+            .setPlaceholder("e.g. firstlast0@schools.vic.edu.au")
+            .setStyle(TextInputStyle.Short)
+            .setMaxLength(120)
+            .setRequired(true),
+        ),
+      ),
+  );
+}
+
+/**
+ * Handles the /request modal: validates the input, proves the student's class
+ * from their roster email, then stores the request for admin approval.
+ */
+async function handleServerRequestModal(
+  interaction: ModalSubmitInteraction,
+): Promise<void> {
+  const now = Date.now();
+  const lastAttempt = lastAttemptByUser.get(interaction.user.id);
+  if (lastAttempt && now - lastAttempt < COOLDOWN_MS) {
+    await interaction.reply({
+      content: "Hang on a second before trying again.",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  lastAttemptByUser.set(interaction.user.id, now);
+
+  const serverInput = interaction.fields.getTextInputValue("server_id").trim();
+  const inviteInput =
+    (interaction.fields.getTextInputValue("server_invite") ?? "").trim() || null;
+  const serverId = serverInput.replace(/\D/g, "");
+
+  if (!/^\d{17,20}$/.test(serverId)) {
+    await interaction.reply({
+      content:
+        "That doesn't look like a server ID — enable Developer Mode, right-click the server → **Copy Server ID**.",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  if (
+    inviteInput &&
+    !/^https:\/\/(discord\.gg|discord\.com\/invite)\/\S+$/i.test(inviteInput)
+  ) {
+    await interaction.reply({
+      content: "The invite must be a discord.gg or discord.com/invite link.",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const result = verifyEmail(interaction.fields.getTextInputValue(EMAIL_FIELD_ID));
+  if (result.status === "invalid_email") {
+    await interaction.reply({
+      content:
+        "That doesn't look like an email address — it should look like `firstlast0@schools.vic.edu.au`.",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  if (result.status === "not_found") {
+    await interaction.reply({
+      content: "I have no data for that email — you may need a manual review from a server admin.",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  // On the roster (ok or no_role): their class is what matters here.
+  const className = result.entry.className;
+
+  let ownRequest: ServerRequest | null;
+  let existing: ClassServerRecord | null;
+  try {
+    ownRequest = await store.getServerRequest(interaction.user.id);
+    existing = await store.getClassServer(className);
+  } catch {
+    await interaction.reply({
+      content: STORAGE_DOWN_MESSAGE,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const decision = decideServerRequest({
+    currentUserId: interaction.user.id,
+    ownRequest,
+    existingGuildId: existing?.guildId ?? null,
+    className,
+  });
+  // The class always comes from the student's own verified roster email, so
+  // "your own class only" holds by construction — nothing else can be entered.
+
+  if (decision.action === "reject") {
+    await interaction.reply({
+      content: `**${className}** already has a server bound to it — ask an admin to run \`/class-server clear class:${className}\` if it needs to change.`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  if (decision.action === "duplicate") {
+    await interaction.reply({
+      content: `Your request for **${className}** (server \`${ownRequest!.serverId}\`) is already waiting for an admin.`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  try {
+    await store.setServerRequest({
+      userId: interaction.user.id,
+      userTag: interaction.user.tag,
+      className,
+      serverId,
+      invite: inviteInput,
+      guildId: interaction.guildId ?? "",
+      requestedAt: new Date(now).toISOString(),
+    });
+  } catch {
+    await interaction.reply({
+      content: STORAGE_DOWN_MESSAGE,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  console.log(
+    `[request] ${interaction.user.tag} requested a server for ${className}`,
+  );
+  await interaction.reply({
+    content: `Request in ✅ An admin will review it with \`/server-request list\` — you'll get a DM once the **${className}** server is added, then you can run \`/verify\`.`,
+    flags: MessageFlags.Ephemeral,
+  });
+}
 
 async function handleClassServerCommand(
   interaction: ChatInputCommandInteraction,
@@ -1278,6 +1473,234 @@ export const COUNTING_COMMAND = {
 
 const CLASS_CHOICES = CLASS_NAMES.map((name) => ({ name, value: name }));
 
+// ── Admin side of student server requests: /server-request ─────────────
+
+async function handleServerRequestCommand(
+  interaction: ChatInputCommandInteraction,
+): Promise<void> {
+  if (!interaction.inGuild()) {
+    await interaction.reply({
+      content: "Please run `/server-request` inside the server.",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  if (!(await hasAdminRole(interaction))) {
+    await interaction.reply({
+      content: ADMIN_ROLE_MESSAGE,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const subcommand = interaction.options.getSubcommand();
+
+  if (subcommand === "list") {
+    let requests: ServerRequest[];
+    try {
+      requests = await store.listServerRequests();
+    } catch {
+      await interaction.reply({
+        content: STORAGE_DOWN_MESSAGE,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    if (requests.length === 0) {
+      await interaction.reply({
+        content: "No server requests ✅",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    requests.sort((a, b) => a.requestedAt.localeCompare(b.requestedAt));
+    const lines = requests.slice(0, 40).map(
+      (r) =>
+        `• <@${r.userId}> wants **${r.className}** → \`${r.serverId}\`${r.invite ? " (invite attached)" : ""} — ${formatWhen(r.requestedAt)}`,
+    );
+    if (requests.length > 40) lines.push("…and more.");
+    await interaction.reply({
+      content: `**${requests.length} server request(s):**\n${lines.join("\n")}`, flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  if (subcommand === "approve") {
+    const target = interaction.options.getUser("user", true);
+    let request: ServerRequest | null;
+    try {
+      request = await store.getServerRequest(target.id);
+    } catch {
+      await interaction.reply({
+        content: STORAGE_DOWN_MESSAGE,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    if (!request) {
+      await interaction.reply({
+        content: `No server request from ${target.tag}.`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const existing = await store
+      .getClassServer(request.className)
+      .catch(() => null);
+    if (existing) {
+      await interaction.reply({
+        content: `**${request.className}** already has server \`${existing.guildId}\` — deny this request or clear the binding first.`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    try {
+      await store.setClassServer(request.className, {
+        guildId: request.serverId,
+        invite: request.invite,
+        setAt: new Date().toISOString(),
+      });
+      await store.deleteServerRequest(request.userId);
+    } catch {
+      await interaction.reply({
+        content: STORAGE_DOWN_MESSAGE,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    const botThere = botClient?.guilds.cache.has(request.serverId) ?? false;
+    const appInvite = classServerInviteUrl(botClient, request.serverId);
+    try {
+      const user = await botClient?.users.fetch(request.userId);
+      await user?.send(
+        `Your request was approved ✅ The **${request.className}** server is set up — run \`/verify\` in the main server.` +
+          (appInvite ? `\n\nInvite the bot to the server (admins too): ${appInvite}` : ""),
+      );
+    } catch {
+      // DMs closed — the admin reply carries the info instead.
+    }
+
+    console.log(`[request] approved ${request.userTag} -> ${request.className}`);
+    await interaction.reply({
+      content:
+        `Approved ✅ **${request.className}** → server \`${request.serverId}\` (invite ${request.invite ? "stored" : "created later on approval"}).\n` +
+        (botThere
+          ? "I'm already in that server ✅ — reviews for this class are unlocked."
+          : `⚠️ Not in that server yet — reviews stay locked until I'm invited${appInvite ? `: ${appInvite}` : " (use the invite URL from the startup logs)"}.`),
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  // deny
+  const target = interaction.options.getUser("user", true);
+  const reason = (interaction.options.getString("reason") ?? "").trim();
+  let request: ServerRequest | null;
+  try {
+    request = await store.getServerRequest(target.id);
+  } catch {
+    await interaction.reply({
+      content: STORAGE_DOWN_MESSAGE,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  if (!request) {
+    await interaction.reply({
+      content: `No server request from ${target.tag}.`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  try {
+    await store.deleteServerRequest(request.userId);
+  } catch {
+    await interaction.reply({
+      content: STORAGE_DOWN_MESSAGE,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  try {
+    const user = await botClient?.users.fetch(request.userId);
+    await user?.send(
+      `Your request to add the **${request.className}** server was declined${reason ? `: ${reason}` : "."} — you can run \`/request\` again.`,
+    );
+  } catch {
+    // DMs closed — the admin reply carries the info instead.
+  }
+  await interaction.reply({
+    content: `Denied **${request.userTag}**'s server request (${request.className} → \`${request.serverId}\`)${reason ? ` — ${reason}` : ""}.`,
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+/** Invite URL for adding the bot to a specific server (same permissions as the main one). */
+function classServerInviteUrl(client: Client | null, guildId: string): string {
+  const applicationId = client?.user?.id;
+  if (!applicationId) return "";
+  const params = new URLSearchParams({
+    client_id: applicationId,
+    permissions: String(INVITE_PERMISSIONS),
+    guild_id: guildId,
+    disable_guild_select: "true",
+  });
+  return `https://discord.com/oauth2/authorize?${params.toString()}&scope=bot%20applications.commands`;
+}
+
+export const REQUEST_COMMAND = {
+  name: "request",
+  description: "Ask for your class's Discord server to be added",
+  dm_permission: false,
+} as const;
+
+export const SERVER_REQUEST_COMMAND = {
+  name: "server-request",
+  description: "Handle student requests to add class servers (admin role)",
+  dm_permission: false,
+  options: [
+    {
+      type: ApplicationCommandOptionType.Subcommand,
+      name: "list",
+      description: "List open server requests",
+    },
+    {
+      type: ApplicationCommandOptionType.Subcommand,
+      name: "approve",
+      description: "Approve a request — binds the class's server",
+      options: [
+        {
+          type: ApplicationCommandOptionType.User,
+          name: "user",
+          description: "Whose request to approve",
+          required: true,
+        },
+      ],
+    },
+    {
+      type: ApplicationCommandOptionType.Subcommand,
+      name: "deny",
+      description: "Decline a request",
+      options: [
+        {
+          type: ApplicationCommandOptionType.User,
+          name: "user",
+          description: "Whose request to decline",
+          required: true,
+        },
+        {
+          type: ApplicationCommandOptionType.String,
+          name: "reason",
+          description: "Why (sent to the student)",
+          required: false,
+        },
+      ],
+    },
+  ],
+};
+
 export const REVIEW_COMMAND = {
   name: "review",
   description: "Approve or deny pending student verifications (admin role)",
@@ -1398,7 +1821,14 @@ async function registerCommands(client: Client): Promise<void> {
   const applicationId = client.user?.id;
   if (!applicationId) return;
 
-  const commands = [VERIFY_COMMAND, COUNTING_COMMAND, REVIEW_COMMAND, CLASS_SERVER_COMMAND];
+  const commands = [
+    VERIFY_COMMAND,
+    COUNTING_COMMAND,
+    REVIEW_COMMAND,
+    CLASS_SERVER_COMMAND,
+    REQUEST_COMMAND,
+    SERVER_REQUEST_COMMAND,
+  ];
 
   const globalRegistration = client.rest
     .put(Routes.applicationCommands(applicationId), { body: commands })
@@ -1432,8 +1862,7 @@ async function registerCommands(client: Client): Promise<void> {
 
 /** Ready-to-paste invite link with the permissions this bot needs. */
 function inviteUrl(applicationId: string): string {
-  // View Channel (1024) + Send Messages (2048) + Read Message History (65536) + Manage Messages (131072) + Manage Roles (268435456)
-  const permissions = 1024 + 2048 + 65536 + 131072 + 268435456;
+  const permissions = INVITE_PERMISSIONS;
   const params = new URLSearchParams({
     client_id: applicationId,
     permissions: String(permissions),

@@ -63,6 +63,50 @@ export type ReviewRequestDecision =
         | "bot_missing";
     };
 
+/** A student's request to link a Discord server to their class. */
+export interface ServerRequest {
+  userId: string;
+  userTag: string;
+  /** The class the requester belongs to (from their roster email). */
+  className: string;
+  /** The Discord server ID the student wants to add for this class. */
+  serverId: string;
+  /** Invite link for that server, if the student supplied one. */
+  invite: string | null;
+  /** Guild where /request ran (the main server). */
+  guildId: string;
+  requestedAt: string;
+}
+
+export interface ServerRequestInput {
+  currentUserId: string;
+  /** This student's own pending server request, if any. */
+  ownRequest: ServerRequest | null;
+  /** The class's existing binding, if any. */
+  existingGuildId: string | null | undefined;
+  /** The roster class the student was matched to (always their own). */
+  className: string;
+}
+
+export type ServerRequestDecision =
+  /** Store the request for /server-request list. */
+  | { action: "create" }
+  /** The student already has one open — show it instead of duplicating. */
+  | { action: "duplicate" }
+  /** That class already has a server bound to it. */
+  | { action: "reject"; reason: "already_bound" };
+
+/** Decides what /request should do with a class-server request. */
+export function decideServerRequest(
+  input: ServerRequestInput,
+): ServerRequestDecision {
+  if (input.existingGuildId) {
+    return { action: "reject", reason: "already_bound" };
+  }
+  if (input.ownRequest) return { action: "duplicate" };
+  return { action: "create" };
+}
+
 /** Decides what /verify should do for a roster-matched email. */
 export function decideReviewRequest(
   input: ReviewRequestInput,

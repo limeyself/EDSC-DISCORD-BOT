@@ -8,6 +8,7 @@ import {
   decideVerification,
   emailKey,
   pendingKey,
+  serverRequestKey,
   userKey,
   type VerifyRecord,
 } from "./store.ts";
@@ -66,6 +67,17 @@ describe("counting key namespacing", () => {
     assert.notEqual(countingChannelKey("g"), countingStateKey("g"));
     // …and cannot collide with the verification registry either.
     assert.ok(!countingChannelKey("g").startsWith("classbot:verify:"));
+  });
+});
+
+describe("server request key", () => {
+  test("server requests live under verify:pending:req:<userId>", () => {
+    assert.equal(
+      serverRequestKey("222"),
+      "classbot:verify:pending:req:222",
+    );
+    // ...and can't collide with a verification request for the same user.
+    assert.notEqual(serverRequestKey("222"), pendingKey("222"));
   });
 });
 

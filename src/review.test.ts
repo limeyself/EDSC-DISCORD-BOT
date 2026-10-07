@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
   decideReviewRequest,
+  decideServerRequest,
   type PendingReview,
   type ReviewRequestInput,
+  type ServerRequest,
 } from "./review.ts";
 
 const pendingFor = (userId: string): PendingReview => ({
@@ -95,5 +97,57 @@ describe("decideReviewRequest", () => {
       classServerGuildId: null,
     });
     assert.deepEqual(decision, { action: "reject", reason: "slot_taken" });
+  });
+});
+
+describe("decideServerRequest", () => {
+  const serverRequest = (): ServerRequest => ({
+    userId: "100",
+    userTag: "student#0001",
+    className: "7B",
+    serverId: "999888777666555444",
+    invite: null,
+    guildId: "111222333444555666",
+    requestedAt: "2026-10-07T00:00:00.000Z",
+  });
+
+  const input = {
+    currentUserId: "100",
+    ownRequest: null as ServerRequest | null,
+    existingGuildId: null as string | null,
+    className: "7B",
+  };
+
+  test("everything clear → create", () => {
+    assert.deepEqual(decideServerRequest(input), { action: "create" });
+  });
+
+  test("a student can't have two open server requests", () => {
+    const decision = decideServerRequest({ ...input, ownRequest: serverRequest() });
+    assert.deepEqual(decision, { action: "duplicate" });
+  });
+
+  test("a class that already has a server can't get another one", () => {
+    const decision = decideServerRequest({
+      ...input,
+      existingGuildId: "555444333222111000",
+    });
+    assert.deepEqual(decision, {
+      action: "reject",
+      reason: "already_bound",
+    });
+  });
+
+  test("the same class check drives both the request and its rejection", () => {
+    // The modal derives the class from the roster email, so the request and
+    // its target class are always the student's own — mirrored here.
+    const bound = decideServerRequest({
+      ...input,
+      className: "7B",
+      existingGuildId: "1",
+    });
+    assert.equal(bound.action, "reject");
+    const free = decideServerRequest({ ...input, className: "7B" });
+    assert.equal(free.action, "create");
   });
 });

@@ -1,6 +1,6 @@
 import { createClient } from "redis";
 import { isCountingState, type CountingState } from "./counting.ts";
-import type { PendingReview } from "./review.ts";
+import type { PendingReview, ServerRequest } from "./review.ts";
 
 /**
  * Default connection supplied by the server admins. Override with the
@@ -60,6 +60,10 @@ export function classSlotKey(className: string): string {
 
 export function classServerKey(className: string): string {
   return `${CLASS_SERVER_PREFIX}${className}`;
+}
+
+export function serverRequestKey(userId: string): string {
+  return `${PENDING_PREFIX}req:${userId}`;
 }
 
 export type VerificationDecision =
@@ -282,6 +286,49 @@ export class VerifyStore {
 
   async releaseClassSlot(className: string): Promise<void> {
     await this.client.del(classSlotKey(className));
+  }
+
+  /** A student's open request to add their class's server, if any. */
+  async getServerRequest(userId: string): Promise<ServerRequest | null> {
+    const raw = await this.client.get(serverRequestKey(userId));
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw) as Partial<ServerRequest>;
+      return typeof parsed.userId === "string" && typeof parsed.serverId === "string"
+        ? (parsed as ServerRequest)
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async setServerRequest(request: ServerRequest): Promise<void> {
+    await this.client.set(serverRequestKey(request.userId), JSON.stringify(request));
+  }
+
+  async deleteServerRequest(userId: string): Promise<void> {
+    await this.client.del(serverRequestKey(userId));
+  }
+
+  /** Every open server request (for /server-request list), capped at 500. */
+  async listServerRequests(): Promise<ServerRequest[]> {
+    const requests: ServerRequest[] = [];
+    for await (const keys of this.client.scanIterator({
+      MATCH: `${PENDING_PREFIX}req:*`,
+      COUNT: 100,
+    })) {
+      for (const key of keys) {
+        const raw = await this.client.get(key);
+        if (!raw) continue;
+        try {
+          requests.push(JSON.parse(raw) as ServerRequest);
+        } catch {
+          // Skip unreadable entries; a human reviews the rest of the list.
+        }
+      }
+      if (requests.length >= 500) break;
+    }
+    return requests;
   }
 
   /** Which Discord server a class uses (for the approval DM). */

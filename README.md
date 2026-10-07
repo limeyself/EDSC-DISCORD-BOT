@@ -13,9 +13,14 @@ stripping — no bundler or transpiler involved).
 
 ## How it works
 
-1. Admins set up each class's Discord server once: `/class-server set class:7A server:<id>`
-   (run anywhere — just the server ID) and invite the bot to that server.
-2. A student runs `/verify` in the **main server** and submits their school email
+1. A student of a class with no server yet runs `/request` in the **main server**:
+   the modal collects the **class server's ID**, an optional **invite link**, and
+   their **school email** (which proves which class they belong to — they can only
+   ever request their own class's server).
+2. An admin approves with `/server-request approve user:@student`, which binds
+   the class to that server (or denies with `/server-request deny`). The student
+   then invites the bot to that server using the link in the admin reply.
+3. A student runs `/verify` in the **main server** and submits their school email
    in a **private modal** — nothing is posted in chat.
 3. The email is normalized and looked up in the roster CSV. The request is refused
    (with a clear reason) if the roster has no data for it, another user already
@@ -82,6 +87,23 @@ permission bits, so it replaces all previous permission requirements.
 
 Run `/verify`, type the school email, wait for an admin's `/review approve`, and
 the class role plus the class-server invite arrive by DM.
+
+## Adding a class server (student /request → admin /server-request)
+
+Students get their class's server linked without touching admin commands:
+
+| Command | Who | What it does |
+| --- | --- | --- |
+| `/request` | student | Opens a private modal: class server ID, optional invite link, school email (identity + class proof). |
+| `/server-request list` | admin role | Open requests: student, class, server ID, invite, request time (Melbourne). |
+| `/server-request approve user:@student` | admin role | Binds that class to the submitted server, clears the request, DMs the student; reply shows the bot-invite link for the class server. |
+| `/server-request deny user:@student [reason]` | admin role | Removes the request and DMs the student. |
+
+Rules: the class is derived from the submitted roster email, so students can
+only request **their own class**; a student can have only **one** open request;
+and a class that already has a server can't receive another (admins change that
+via `/class-server clear` instead). Admins can still bind servers directly with
+`/class-server set` at any time.
 
 ## Manual review & class servers
 
@@ -150,6 +172,7 @@ overridable with the `REDIS_URL` environment variable:
 | `classbot:verify:pending:<userId>` | JSON pending review `{userId, userTag, email, className, guildId, requestedAt}` |
 | `classbot:verify:slot:<className>` | the userId holding that class's server slot (`SET NX`) |
 | `classbot:classserver:<className>` | JSON `{guildId, invite, setAt}` — the class's registered server |
+| `classbot:verify:pending:req:<userId>` | JSON server request `{userId, userTag, className, serverId, invite, requestedAt}` |
 
 Claims are permanent and conflict-free by construction (`SET NX`): a second user submitting
 the same address is told a user already used it and that manual review may be required. The
@@ -221,3 +244,5 @@ Messages lets it delete wrong numbers.
 | "Someone already holds the … server slot" | The class already has a student in review/approved — run `/review release class:<name>` to free it. |
 | "I don't have a server registered for …" / "I'm not in the … server" | Run `/class-server set` with the class server's ID and invite the bot to that server, then retry `/verify`. |
 | Approval says "couldn't DM them" | The student has DMs closed — relay the invite shown in the admin reply manually. |
+| "**7B** already has a server bound to it" (on /request or approve) | That class already has a server. An admin can `/class-server clear class:7B` first if it genuinely needs to change. |
+| "Your request for **7B** … is already waiting" | The student already has an open server request — wait for an admin's `/server-request approve` or `deny`. |
