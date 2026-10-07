@@ -105,6 +105,7 @@ let botClient: Client | null = null;
 const countingChannelByGuild = new Map<string, string>();
 const countingStateByGuild = new Map<string, CountingState>();
 let warnedMissingContentIntent = false;
+let announcedNoContentIntent = false;
 
 const token = process.env.DISCORD_BOT_TOKEN?.trim();
 
@@ -312,12 +313,37 @@ async function handleCountingMessage(message: Message): Promise<void> {
     );
   }
 
+  // Counting is impossible without message content — say it in the channel
+  // once instead of silently dropping every number.
+  if (
+    process.env.DISABLE_MESSAGE_CONTENT_INTENT &&
+    !announcedNoContentIntent &&
+    "send" in message.channel
+  ) {
+    announcedNoContentIntent = true;
+    await message.channel
+      .send(
+        "⚠️ I was started with DISABLE_MESSAGE_CONTENT_INTENT=1, so I can't read the numbers posted here. Remove that variable (and make sure the Message Content Intent is on in the Developer Portal), then restart me.",
+      )
+      .catch(() => undefined);
+  }
+
   const state = await resolveCountingState(guildId);
   const outcome = evaluateCountingMessage(state, {
     content: message.content,
     authorIsBot: message.author.bot,
   });
-  if (outcome.kind === "ignore") return;
+  // The channel is dedicated to counting, so every handled message is worth a
+  // log line — this makes "setup succeeded but nothing happens" diagnosable.
+  if (outcome.kind === "ignore") {
+    console.log(
+      `[counting] ignored a message from ${message.author.tag} in <#${channelId}> (chat or empty content)`,
+    );
+    return;
+  }
+  console.log(
+    `[counting] ${message.author.tag} posted "${message.content}" → ${outcome.kind}`,
+  );
 
   countingStateByGuild.set(guildId, outcome.next);
   persistCountingState(guildId, outcome.next);
@@ -493,11 +519,20 @@ async function handleCountingCommand(
         persisted = false;
       }
     }
-    const note = persisted
-      ? ""
-      : " ⚠️ I can't reach the verification store, so this only lasts until a restart.";
+    const notes = [
+      ...(persisted
+        ? []
+        : [
+            " ⚠️ I can't reach the verification store, so this only lasts until a restart.",
+          ]),
+      ...(process.env.DISABLE_MESSAGE_CONTENT_INTENT
+        ? [
+            " ⚠️ DISABLE_MESSAGE_CONTENT_INTENT is set — I can't read numbers until it's removed.",
+          ]
+        : []),
+    ].join("");
     await interaction.reply({
-      content: `Counting channel set to <#${channel.id}> — post **1**, **2**, **3** … in order. Get one wrong and the count starts over.${note}`,
+      content: `Counting channel set to <#${channel.id}> — post **1**, **2**, **3** … in order. Get one wrong and the count starts over.${notes}`,
       flags: MessageFlags.Ephemeral,
     });
     return;
@@ -757,8 +792,16 @@ async function completeReverification(
   if (!granted) return; // assignClassRole already replied with the reason
 
   console.log(`[bot] re-verified ${interaction.user.tag} -> ${className}`);
+
+  // This is the moment most students re-run /verify — always tell them their
+  // class server is available and hand them the invite right here.
+  const invite = await resolveClassInvite(className);
+  const serverLine = invite
+    ? `\n\nYour **${className}** class server is ready — join here: ${invite}`
+    : "\n\nNo server is set up for your class yet — an admin can add one with `/class-server set`.";
+
   await interaction.reply({
-    content: `Verified ✅ You now have the **${className}** class role.`,
+    content: `Verified ✅ You now have the **${className}** class role.${serverLine}`,
     flags: MessageFlags.Ephemeral,
   });
 }
