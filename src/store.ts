@@ -1,5 +1,6 @@
 import { createClient } from "redis";
 import { isCountingState, type CountingState } from "./counting.ts";
+import type { PendingReview } from "./review.ts";
 
 /**
  * Default connection supplied by the server admins. Override with the
@@ -22,6 +23,16 @@ const EMAIL_PREFIX = "classbot:verify:email:";
 const USER_PREFIX = "classbot:verify:user:";
 const COUNTING_CHANNEL_PREFIX = "classbot:counting:channel:";
 const COUNTING_STATE_PREFIX = "classbot:counting:state:";
+const PENDING_PREFIX = "classbot:verify:pending:";
+const SLOT_PREFIX = "classbot:verify:slot:";
+const CLASS_SERVER_PREFIX = "classbot:classserver:";
+
+/** A class's registered Discord server (used for the invite DM on approval). */
+export interface ClassServerRecord {
+  guildId: string;
+  invite: string | null;
+  setAt: string;
+}
 
 export function emailKey(email: string): string {
   return `${EMAIL_PREFIX}${email}`;
@@ -37,6 +48,18 @@ export function countingChannelKey(guildId: string): string {
 
 export function countingStateKey(guildId: string): string {
   return `${COUNTING_STATE_PREFIX}${guildId}`;
+}
+
+export function pendingKey(userId: string): string {
+  return `${PENDING_PREFIX}${userId}`;
+}
+
+export function classSlotKey(className: string): string {
+  return `${SLOT_PREFIX}${className}`;
+}
+
+export function classServerKey(className: string): string {
+  return `${CLASS_SERVER_PREFIX}${className}`;
 }
 
 export type VerificationDecision =
@@ -199,6 +222,88 @@ export class VerifyStore {
 
   async setCountingState(guildId: string, state: CountingState): Promise<void> {
     await this.client.set(countingStateKey(guildId), JSON.stringify(state));
+  }
+
+  /** A verification waiting for an admin decision. */
+  async getPending(userId: string): Promise<PendingReview | null> {
+    const raw = await this.client.get(pendingKey(userId));
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw) as Partial<PendingReview>;
+      return typeof parsed.userId === "string" && typeof parsed.className === "string"
+        ? (parsed as PendingReview)
+        : null;
+    } catch {
+      return null; // Corrupt entry: treat as no review so the student can retry.
+    }
+  }
+
+  async setPending(review: PendingReview): Promise<void> {
+    await this.client.set(pendingKey(review.userId), JSON.stringify(review));
+  }
+
+  async deletePending(userId: string): Promise<void> {
+    await this.client.del(pendingKey(userId));
+  }
+
+  /** Every pending review (for /review list), capped at 500. */
+  async listPending(): Promise<PendingReview[]> {
+    const reviews: PendingReview[] = [];
+    for await (const keys of this.client.scanIterator({
+      MATCH: `${PENDING_PREFIX}*`,
+      COUNT: 100,
+    })) {
+      for (const key of keys) {
+        const raw = await this.client.get(key);
+        if (!raw) continue;
+        try {
+          reviews.push(JSON.parse(raw) as PendingReview);
+        } catch {
+          // Skip an unreadable entry instead of failing the whole list.
+        }
+      }
+      if (reviews.length >= 500) break;
+    }
+    return reviews;
+  }
+
+  /** Who holds this class's server slot (one review per class at a time). */
+  async getClassSlot(className: string): Promise<string | null> {
+    return (await this.client.get(classSlotKey(className))) || null;
+  }
+
+  /** Atomic slot claim (SET NX): true when this student now holds it. */
+  async claimClassSlot(className: string, userId: string): Promise<boolean> {
+    const result = await this.client.set(classSlotKey(className), userId, {
+      NX: true,
+    });
+    return result === "OK";
+  }
+
+  async releaseClassSlot(className: string): Promise<void> {
+    await this.client.del(classSlotKey(className));
+  }
+
+  /** Which Discord server a class uses (for the approval DM). */
+  async getClassServer(className: string): Promise<ClassServerRecord | null> {
+    const raw = await this.client.get(classServerKey(className));
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw) as Partial<ClassServerRecord>;
+      return typeof parsed.guildId === "string" && parsed.guildId
+        ? (parsed as ClassServerRecord)
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async setClassServer(className: string, record: ClassServerRecord): Promise<void> {
+    await this.client.set(classServerKey(className), JSON.stringify(record));
+  }
+
+  async deleteClassServer(className: string): Promise<void> {
+    await this.client.del(classServerKey(className));
   }
 
   async close(): Promise<void> {

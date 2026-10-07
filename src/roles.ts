@@ -28,3 +28,13 @@ export const CLASS_ROLE_IDS: Record<string, string> = {
 
 /** Every class role ID the bot is allowed to add or remove. */
 export const SECTION_ROLE_IDS: Set<string> = new Set(Object.values(CLASS_ROLE_IDS));
+
+/** Every class name ("7A" … "7R"), for command choices and listings. */
+export const CLASS_NAMES: string[] = Object.keys(CLASS_ROLE_IDS);
+
+/**
+ * Admin role: the only gate for admin commands (review approve/deny/release,
+ * class-server setup, counting setup/reset). Replaces permission-bit checks —
+ * anyone wearing this role can run them, anywhere the bot can see them.
+ */
+export const ADMIN_ROLE_ID = "1557298773951123476";

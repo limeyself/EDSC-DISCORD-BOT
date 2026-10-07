@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
+  classServerKey,
+  classSlotKey,
   countingChannelKey,
   countingStateKey,
   decideVerification,
   emailKey,
+  pendingKey,
   userKey,
   type VerifyRecord,
 } from "./store.ts";
@@ -63,6 +66,17 @@ describe("counting key namespacing", () => {
     assert.notEqual(countingChannelKey("g"), countingStateKey("g"));
     // …and cannot collide with the verification registry either.
     assert.ok(!countingChannelKey("g").startsWith("classbot:verify:"));
+  });
+});
+
+describe("review key namespacing", () => {
+  test("pending, slot and class-server keys are namespaced and distinct", () => {
+    assert.equal(pendingKey("111"), "classbot:verify:pending:111");
+    assert.equal(classSlotKey("7A"), "classbot:verify:slot:7A");
+    assert.equal(classServerKey("7A"), "classbot:classserver:7A");
+    assert.notEqual(classSlotKey("7A"), classServerKey("7A"));
+    // The pending key space can't collide with email claims either.
+    assert.notEqual(pendingKey("x"), emailKey("x"));
   });
 });
 

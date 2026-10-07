@@ -26,8 +26,22 @@ import {
 } from "./counting.ts";
 import { startHealthServer } from "./health.ts";
 import { loadRoster, rosterPath } from "./roster.ts";
-import { SECTION_ROLE_IDS } from "./roles.ts";
-import { decideVerification, store, type VerifyRecord } from "./store.ts";
+import {
+  decideReviewRequest,
+  type PendingReview,
+} from "./review.ts";
+import {
+  ADMIN_ROLE_ID,
+  CLASS_NAMES,
+  CLASS_ROLE_IDS,
+  SECTION_ROLE_IDS,
+} from "./roles.ts";
+import {
+  decideVerification,
+  store,
+  type ClassServerRecord,
+  type VerifyRecord,
+} from "./store.ts";
 import { verifyEmail } from "./verify.ts";
 
 const MODAL_ID = "verify:email";
@@ -76,6 +90,9 @@ void store.start();
 
 const lastAttemptByUser = new Map<string, number>();
 
+/** Set once the Discord client exists — review approvals need it for DMs. */
+let botClient: Client | null = null;
+
 /**
  * Counting channel cache per guild. Maps hold "" for "no channel configured"
  * so busy servers don't hammer Redis on every message; setup overwrites it.
@@ -114,6 +131,7 @@ async function startBot(botToken: string): Promise<void> {
     intents.push(GatewayIntentBits.MessageContent);
   }
   const client = new Client({ intents });
+  botClient = client;
 
   client.on(Events.Error, (error) => {
     console.error(`[bot] gateway error: ${error.message}`);
@@ -167,6 +185,10 @@ async function handleInteraction(interaction: Interaction): Promise<void> {
     if (interaction.commandName === "verify") await handleVerifyCommand(interaction);
     else if (interaction.commandName === "counting") {
       await handleCountingCommand(interaction);
+    } else if (interaction.commandName === "review") {
+      await handleReviewCommand(interaction);
+    } else if (interaction.commandName === "class-server") {
+      await handleClassServerCommand(interaction);
     }
     return;
   }
@@ -239,7 +261,7 @@ async function handleVerifyModal(interaction: ModalSubmitInteraction): Promise<v
       return;
 
     case "ok":
-      await completeVerification(
+      await handleRosterMatch(
         interaction,
         result.email,
         result.entry.className,
@@ -342,8 +364,34 @@ function persistCountingState(guildId: string, counting: CountingState): void {
   });
 }
 
-function canManageCounting(interaction: ChatInputCommandInteraction): boolean {
-  return interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild) ?? false;
+/**
+ * Admin gate: role 1557298773951123476 instead of permission bits — the only
+ * requirement for review, class-server and counting admin commands.
+ */
+async function hasAdminRole(
+  interaction: ChatInputCommandInteraction,
+): Promise<boolean> {
+  if (!interaction.guild) return false;
+  const member =
+    interaction.member instanceof GuildMember
+      ? interaction.member
+      : await interaction.guild.members
+          .fetch(interaction.user.id)
+          .catch(() => null);
+  return member?.roles.cache.has(ADMIN_ROLE_ID) ?? false;
+}
+
+const ADMIN_ROLE_MESSAGE = `This is admin-only — you need the <@&${ADMIN_ROLE_ID}> role.`;
+
+/** Melbourne-local time for review listings (invalid input → "—"). */
+function formatWhen(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "—";
+  return date.toLocaleString("en-AU", {
+    timeZone: "Australia/Melbourne",
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
 }
 
 async function handleCountingCommand(
@@ -361,9 +409,9 @@ async function handleCountingCommand(
   const subcommand = interaction.options.getSubcommand();
 
   if (subcommand === "setup") {
-    if (!canManageCounting(interaction)) {
+    if (!(await hasAdminRole(interaction))) {
       await interaction.reply({
-        content: "You need the **Manage Server** permission to pick the counting channel.",
+        content: ADMIN_ROLE_MESSAGE,
         flags: MessageFlags.Ephemeral,
       });
       return;
@@ -437,9 +485,9 @@ async function handleCountingCommand(
   }
 
   if (subcommand === "reset") {
-    if (!canManageCounting(interaction)) {
+    if (!(await hasAdminRole(interaction))) {
       await interaction.reply({
-        content: "You need the **Manage Server** permission to reset the count.",
+        content: ADMIN_ROLE_MESSAGE,
         flags: MessageFlags.Ephemeral,
       });
       return;
@@ -458,10 +506,143 @@ async function handleCountingCommand(
 }
 
 /**
- * Full verification pipeline: check the Redis registry, claim the email if it
- * is free, grant the class role, then persist the record.
+ * Roster matched — apply the manual-review gates: either open a pending
+ * review (claiming the class's server slot) or re-grant to an approved student.
  */
-async function completeVerification(
+async function handleRosterMatch(
+  interaction: ModalSubmitInteraction,
+  email: string,
+  className: string,
+  roleId: string,
+): Promise<void> {
+  const userId = interaction.user.id;
+  const guildId = interaction.guildId;
+  if (!guildId) {
+    await interaction.reply({
+      content: "Please run `/verify` inside the server.",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  let pending: PendingReview | null;
+  let record: VerifyRecord | null;
+  let slotHolder: string | null;
+  let classServer: ClassServerRecord | null;
+  try {
+    pending = await store.getPending(userId);
+    record = await store.getRecord(email);
+    slotHolder = await store.getClassSlot(className);
+    classServer = await store.getClassServer(className);
+  } catch {
+    await interaction.reply({
+      content: STORAGE_DOWN_MESSAGE,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const decision = decideReviewRequest({
+    currentUserId: userId,
+    pending,
+    record,
+    slotHolder,
+    classServerGuildId: classServer?.guildId ?? null,
+    botInClassServer: Boolean(
+      classServer && botClient?.guilds.cache.has(classServer.guildId),
+    ),
+  });
+
+  if (decision.action === "reject") {
+    await interaction.reply({
+      content: rejectMessage(decision.reason, className),
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  if (decision.action === "reverify") {
+    await completeReverification(interaction, email, className, roleId);
+    return;
+  }
+
+  // Claim the class's server slot first (atomic — one review per class at a
+  // time), then park the request for an admin.
+  let claimedSlot = false;
+  try {
+    claimedSlot = await store.claimClassSlot(className, userId);
+  } catch {
+    await interaction.reply({
+      content: STORAGE_DOWN_MESSAGE,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  if (!claimedSlot) {
+    await interaction.reply({
+      content: rejectMessage("slot_taken", className),
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  try {
+    await store.setPending({
+      userId,
+      userTag: interaction.user.tag,
+      email,
+      className,
+      guildId,
+      requestedAt: new Date().toISOString(),
+    });
+  } catch {
+    await store.releaseClassSlot(className).catch(() => undefined);
+    await interaction.reply({
+      content: STORAGE_DOWN_MESSAGE,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  console.log(
+    `[bot] ${interaction.user.tag} requested a review for ${className}`,
+  );
+  await interaction.reply({
+    content:
+      "Review requested ✅ An admin will check it with `/review list` and `/review approve` — you'll get a DM with your class server invite once you're approved.",
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+/** Why a review request was refused. */
+function rejectMessage(
+  reason:
+    | "already_pending"
+    | "taken"
+    | "slot_taken"
+    | "server_missing"
+    | "bot_missing",
+  className: string,
+): string {
+  switch (reason) {
+    case "already_pending":
+      return `Your **${className}** review is already waiting for an admin — you'll hear back by DM.`;
+    case "taken":
+      return MANUAL_REVIEW_MESSAGE;
+    case "slot_taken":
+      return `Someone already holds the **${className}** server slot, so only one review runs at a time. Ask an admin to free it with \`/review release class:${className}\`.`;
+    case "server_missing":
+      return `I don't have a server registered for **${className}** yet — ask an admin to run \`/class-server set class:${className} server:<id>\`, then try again.`;
+    case "bot_missing":
+      return `I'm not in the **${className}** server yet — invite me there first, then run \`/verify\` again.`;
+  }
+}
+
+/**
+ * Re-verification by an already-approved student: refresh the record and
+ * re-grant the class role. Never creates a claim — approvals only happen
+ * through /review approve.
+ */
+async function completeReverification(
   interaction: ModalSubmitInteraction,
   email: string,
   className: string,
@@ -497,27 +678,59 @@ async function completeVerification(
     });
     return;
   }
-
-  let claimedNow = false;
   if (decision === "free") {
+    // The claim vanished between checks — never grant without a review.
+    await interaction.reply({
+      content: "That address needs a fresh review — please run `/verify` again.",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  // Already approved: refresh the record, then re-grant the class role.
+  await store.refresh(record).catch((error: unknown) => {
+    console.error(
+      `[redis] could not refresh record: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  });
+
+  const granted = await assignClassRole(interaction, className, roleId);
+  if (!granted) return; // assignClassRole already replied with the reason
+
+  console.log(`[bot] re-verified ${interaction.user.tag} -> ${className}`);
+  await interaction.reply({
+    content: `Verified ✅ You now have the **${className}** class role.`,
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+// ── Manual review: /review list | approve | deny | release ─────────────
+
+async function handleReviewCommand(
+  interaction: ChatInputCommandInteraction,
+): Promise<void> {
+  if (!interaction.inGuild()) {
+    await interaction.reply({
+      content: "Please run `/review` inside the server.",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  if (!(await hasAdminRole(interaction))) {
+    await interaction.reply({
+      content: ADMIN_ROLE_MESSAGE,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const subcommand = interaction.options.getSubcommand();
+  if (subcommand === "list") {
+    let reviews: PendingReview[];
     try {
-      const claimed = await store.claim(record);
-      if (claimed) {
-        claimedNow = true;
-      } else {
-        // Lost the race: someone claimed this email while we were checking.
-        const current = await store.getRecord(email);
-        if (current && current.userId !== interaction.user.id) {
-          console.log(
-            `[bot] ${interaction.user.tag} submitted an email already claimed by another user`,
-          );
-          await interaction.reply({
-            content: MANUAL_REVIEW_MESSAGE,
-            flags: MessageFlags.Ephemeral,
-          });
-          return;
-        }
-      }
+      reviews = await store.listPending();
     } catch {
       await interaction.reply({
         content: STORAGE_DOWN_MESSAGE,
@@ -525,39 +738,424 @@ async function completeVerification(
       });
       return;
     }
-  }
-
-  const granted = await assignClassRole(interaction, className, roleId);
-  if (!granted) {
-    if (claimedNow) {
-      // Don't burn the email on a failed grant — roll the claim back.
-      await store.release(record).catch((error: unknown) => {
-        console.error(
-          `[redis] could not roll back claim: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
+    if (reviews.length === 0) {
+      await interaction.reply({
+        content: "No pending reviews ✅",
+        flags: MessageFlags.Ephemeral,
       });
+      return;
     }
+    reviews.sort((a, b) => a.requestedAt.localeCompare(b.requestedAt));
+    const lines = reviews.slice(0, 40).map(
+      (r) =>
+        `• <@${r.userId}> — **${r.className}** — \`${r.email}\` — ${formatWhen(r.requestedAt)}`,
+    );
+    if (reviews.length > 40) lines.push("…and more — approve by user.");
+    await interaction.reply({
+      content: `**${reviews.length} pending review(s):**\n${lines.join("\n")}`,
+      flags: MessageFlags.Ephemeral,
+    });
     return;
   }
 
-  if (!claimedNow) {
-    // Re-verification by the same user: refresh the stored record.
-    await store.refresh(record).catch((error: unknown) => {
-      console.error(
-        `[redis] could not refresh record: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    });
+  if (subcommand === "approve") {
+    await approveReview(interaction);
+    return;
+  }
+  if (subcommand === "deny") {
+    await denyReview(interaction);
+    return;
   }
 
-  console.log(`[bot] verified ${interaction.user.tag} -> ${className}`);
+  // release
+  const className = interaction.options.getString("class", true);
+  let holder: string | null;
+  try {
+    holder = await store.getClassSlot(className);
+  } catch {
+    await interaction.reply({
+      content: STORAGE_DOWN_MESSAGE,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  if (!holder) {
+    await interaction.reply({
+      content: `Nobody holds the **${className}** slot.`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  try {
+    await store.releaseClassSlot(className);
+  } catch {
+    await interaction.reply({
+      content: STORAGE_DOWN_MESSAGE,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
   await interaction.reply({
-    content: `Verified ✅ You now have the **${className}** class role.`,
+    content: `Released the **${className}** server slot (was held by <@${holder}>) — the next student can request a review.`,
     flags: MessageFlags.Ephemeral,
   });
+}
+
+async function approveReview(
+  interaction: ChatInputCommandInteraction,
+): Promise<void> {
+  const target = interaction.options.getUser("user", true);
+  let pending: PendingReview | null;
+  try {
+    pending = await store.getPending(target.id);
+  } catch {
+    await interaction.reply({
+      content: STORAGE_DOWN_MESSAGE,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  if (!pending) {
+    await interaction.reply({
+      content: `No pending review for ${target.tag}.`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const record: VerifyRecord = {
+    userId: pending.userId,
+    userTag: pending.userTag,
+    email: pending.email,
+    className: pending.className,
+    verifiedAt: new Date().toISOString(),
+  };
+
+  // Claim the email atomically — the same guard /verify has always used.
+  let claimedNow = false;
+  try {
+    const existing = await store.getRecord(pending.email);
+    if (existing && existing.userId !== pending.userId) {
+      await interaction.reply({
+        content:
+          "That email is claimed by a different user — deny this review and resolve the clash first.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    if (existing) {
+      await store.refresh(record);
+    } else {
+      claimedNow = await store.claim(record);
+      if (!claimedNow) {
+        await interaction.reply({
+          content: "That email was just claimed elsewhere — deny this review.",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+    }
+  } catch {
+    await interaction.reply({
+      content: STORAGE_DOWN_MESSAGE,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const roleId = CLASS_ROLE_IDS[pending.className] ?? "";
+  const granted = await grantRoleInGuild(
+    pending.guildId,
+    pending.userId,
+    pending.userTag,
+    pending.className,
+    roleId,
+  );
+  if (!granted.ok) {
+    if (claimedNow) {
+      await store.release(record).catch(() => undefined); // don't burn the email
+    }
+    await interaction.reply({
+      content: `Couldn't grant the class role: ${granted.error}`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  try {
+    await store.deletePending(pending.userId);
+  } catch {
+    console.error("[review] could not clear the pending entry after approval");
+  }
+
+  const invite = await resolveClassInvite(pending.className);
+  const dm = await sendApprovalDm(pending, invite);
+  let dmNote: string;
+  if (dm.ok && invite) dmNote = " — invite DMed";
+  else if (invite) dmNote = ` — couldn't DM them, invite: ${invite}`;
+  else if (dm.ok) dmNote = " (no invite configured — they'll need one)";
+  else dmNote = " — DM failed and no invite is set";
+
+  console.log(`[review] approved ${pending.userTag} -> ${pending.className}`);
+  await interaction.reply({
+    content: `Approved **${pending.userTag}** ✅ — **${pending.className}** class role granted${dmNote}. The slot stays held until an admin runs \`/review release\`.`,
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function denyReview(
+  interaction: ChatInputCommandInteraction,
+): Promise<void> {
+  const target = interaction.options.getUser("user", true);
+  const reason = (interaction.options.getString("reason") ?? "").trim();
+  let pending: PendingReview | null;
+  try {
+    pending = await store.getPending(target.id);
+  } catch {
+    await interaction.reply({
+      content: STORAGE_DOWN_MESSAGE,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  if (!pending) {
+    await interaction.reply({
+      content: `No pending review for ${target.tag}.`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  let released = false;
+  try {
+    const holder = await store.getClassSlot(pending.className);
+    if (holder === pending.userId) {
+      await store.releaseClassSlot(pending.className);
+      released = true;
+    }
+    await store.deletePending(pending.userId);
+  } catch {
+    await interaction.reply({
+      content: STORAGE_DOWN_MESSAGE,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  try {
+    const user = await botClient?.users.fetch(pending.userId);
+    await user?.send(
+      `Your verification review was declined${reason ? `: ${reason}` : "."} — you can run \`/verify\` to request it again.`,
+    );
+  } catch {
+    // DMs closed — the admin's reply below is the fallback.
+  }
+
+  await interaction.reply({
+    content: `Denied **${pending.userTag}**'s review${released ? " and freed the slot" : ""}${reason ? ` (${reason})` : ""}.`,
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+/** Grants the class role in a guild by ID; returns an error message on failure. */
+async function grantRoleInGuild(
+  guildId: string,
+  userId: string,
+  userTag: string,
+  className: string,
+  roleId: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (!botClient) return { ok: false, error: "the bot is not running." };
+  const guild = await botClient.guilds.fetch(guildId).catch(() => null);
+  if (!guild) {
+    return { ok: false, error: `I'm not in the server where they verified (${guildId}).` };
+  }
+  const member =
+    guild.members.cache.get(userId) ??
+    (await guild.members.fetch(userId).catch(() => null));
+  if (!member) {
+    return { ok: false, error: "I couldn't find that member in the server." };
+  }
+  try {
+    // Drop any other class role first so nobody sits in two sections at once.
+    const staleRoleIds = member.roles.cache
+      .filter((role) => SECTION_ROLE_IDS.has(role.id) && role.id !== roleId)
+      .map((role) => role.id);
+    if (staleRoleIds.length > 0) {
+      await member.roles.remove(staleRoleIds, "Verified for a different class");
+    }
+    await member.roles.add(roleId, `School email verified (${className})`);
+  } catch (error) {
+    console.error(
+      `[bot] could not update roles for ${userTag}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+    return { ok: false, error: describeRoleError(error) };
+  }
+  return { ok: true };
+}
+
+/** Invite for the class server: stored link first, else create one live. */
+async function resolveClassInvite(className: string): Promise<string | null> {
+  try {
+    const binding = await store.getClassServer(className);
+    if (!binding) return null;
+    if (binding.invite) return binding.invite;
+    if (!botClient) return null;
+    const guild = await botClient.guilds.fetch(binding.guildId).catch(() => null);
+    if (!guild) return null;
+    const me =
+      guild.members.me ?? (await guild.members.fetchMe().catch(() => null));
+    if (!me) return null;
+    const channel = guild.channels.cache.find(
+      (c) =>
+        c.type === ChannelType.GuildText &&
+        c.permissionsFor(me)?.has(PermissionFlagsBits.CreateInstantInvite),
+    );
+    if (!channel || channel.type !== ChannelType.GuildText) return null;
+    const invite = await channel
+      .createInvite({ maxAge: 0, maxUses: 0, unique: false })
+      .catch(() => null);
+    return invite?.url ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function sendApprovalDm(
+  pending: PendingReview,
+  invite: string | null,
+): Promise<{ ok: true } | { ok: false }> {
+  try {
+    const user = await botClient?.users.fetch(pending.userId);
+    if (!user) return { ok: false };
+    await user.send(
+      `Verified ✅ You now have the **${pending.className}** class role.` +
+        (invite
+          ? `\n\nJoin the **${pending.className}** server: ${invite}`
+          : "\n\nAsk an admin for the class server invite."),
+    );
+    return { ok: true };
+  } catch {
+    return { ok: false };
+  }
+}
+
+// ── Class servers: /class-server set | clear | list ─────────────────────
+
+async function handleClassServerCommand(
+  interaction: ChatInputCommandInteraction,
+): Promise<void> {
+  if (!interaction.inGuild()) {
+    await interaction.reply({
+      content: "Please run `/class-server` inside the server.",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  if (!(await hasAdminRole(interaction))) {
+    await interaction.reply({
+      content: ADMIN_ROLE_MESSAGE,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const subcommand = interaction.options.getSubcommand();
+
+  if (subcommand === "set") {
+    const className = interaction.options.getString("class", true);
+    const serverId = (interaction.options.getString("server") ?? "").trim();
+    const invite =
+      (interaction.options.getString("invite") ?? "").trim() || null;
+    if (!/^\d{17,20}$/.test(serverId)) {
+      await interaction.reply({
+        content:
+          "That doesn't look like a Discord server ID — enable Developer Mode, right-click the server → **Copy Server ID**.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    if (
+      invite &&
+      !/^https:\/\/(discord\.gg|discord\.com\/invite)\/\S+$/i.test(invite)
+    ) {
+      await interaction.reply({
+        content: "The invite must be a discord.gg or discord.com/invite link.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    try {
+      await store.setClassServer(className, {
+        guildId: serverId,
+        invite,
+        setAt: new Date().toISOString(),
+      });
+    } catch {
+      await interaction.reply({
+        content: STORAGE_DOWN_MESSAGE,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const botThere = botClient?.guilds.cache.has(serverId) ?? false;
+    const presence = botThere
+      ? "I'm already in that server ✅"
+      : "⚠️ I'm not in that server yet — invite me before approving any review.";
+    const inviteNote = invite
+      ? ""
+      : " No invite link stored — I'll create one when I approve someone (needs Create Instant Invite).";
+    await interaction.reply({
+      content: `**${className}** is now bound to server \`${serverId}\` — ${presence}.${inviteNote}`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  if (subcommand === "clear") {
+    const className = interaction.options.getString("class", true);
+    try {
+      await store.deleteClassServer(className);
+    } catch {
+      await interaction.reply({
+        content: STORAGE_DOWN_MESSAGE,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    await interaction.reply({
+      content: `Cleared the **${className}** server binding — reviews for that class are blocked until it's set again.`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  // list
+  try {
+    const rows = await Promise.all(
+      CLASS_NAMES.map(async (className) => {
+        const [binding, holder] = await Promise.all([
+          store.getClassServer(className),
+          store.getClassSlot(className),
+        ]);
+        const slot = holder ? `· slot: <@${holder}>` : "· slot free";
+        if (!binding) return `**${className}** — no server — ${slot}`;
+        const botThere = botClient?.guilds.cache.has(binding.guildId) ?? false;
+        return `**${className}** — \`${binding.guildId}\` · bot ${botThere ? "✅" : "❌"} · ${slot}`;
+      }),
+    );
+    await interaction.reply({
+      content: `**Class servers:**\n${rows.join("\n")}`,
+      flags: MessageFlags.Ephemeral,
+    });
+  } catch {
+    await interaction.reply({
+      content: STORAGE_DOWN_MESSAGE,
+      flags: MessageFlags.Ephemeral,
+    });
+  }
 }
 
 /** Grants the class role. Returns false after replying with the reason. */
@@ -678,6 +1276,120 @@ export const COUNTING_COMMAND = {
   ],
 };
 
+const CLASS_CHOICES = CLASS_NAMES.map((name) => ({ name, value: name }));
+
+export const REVIEW_COMMAND = {
+  name: "review",
+  description: "Approve or deny pending student verifications (admin role)",
+  dm_permission: false,
+  options: [
+    {
+      type: ApplicationCommandOptionType.Subcommand,
+      name: "list",
+      description: "List pending verification requests",
+    },
+    {
+      type: ApplicationCommandOptionType.Subcommand,
+      name: "approve",
+      description: "Approve a student's verification",
+      options: [
+        {
+          type: ApplicationCommandOptionType.User,
+          name: "user",
+          description: "The student to approve",
+          required: true,
+        },
+      ],
+    },
+    {
+      type: ApplicationCommandOptionType.Subcommand,
+      name: "deny",
+      description: "Deny a student's verification",
+      options: [
+        {
+          type: ApplicationCommandOptionType.User,
+          name: "user",
+          description: "The student to deny",
+          required: true,
+        },
+        {
+          type: ApplicationCommandOptionType.String,
+          name: "reason",
+          description: "Why (sent to the student)",
+          required: false,
+        },
+      ],
+    },
+    {
+      type: ApplicationCommandOptionType.Subcommand,
+      name: "release",
+      description: "Free a class's server slot so the next student can review",
+      options: [
+        {
+          type: ApplicationCommandOptionType.String,
+          name: "class",
+          description: "Which class slot",
+          required: true,
+          choices: CLASS_CHOICES,
+        },
+      ],
+    },
+  ],
+};
+
+export const CLASS_SERVER_COMMAND = {
+  name: "class-server",
+  description: "Register which Discord server each class uses (admin role)",
+  dm_permission: false,
+  options: [
+    {
+      type: ApplicationCommandOptionType.Subcommand,
+      name: "set",
+      description: "Bind a class to a Discord server (works from anywhere)",
+      options: [
+        {
+          type: ApplicationCommandOptionType.String,
+          name: "class",
+          description: "Which class",
+          required: true,
+          choices: CLASS_CHOICES,
+        },
+        {
+          type: ApplicationCommandOptionType.String,
+          name: "server",
+          description: "The class server's ID (Copy Server ID)",
+          required: true,
+        },
+        {
+          type: ApplicationCommandOptionType.String,
+          name: "invite",
+          description: "Invite link to that server (optional)",
+          required: false,
+        },
+      ],
+    },
+    {
+      type: ApplicationCommandOptionType.Subcommand,
+      name: "clear",
+      description: "Unbind a class's server",
+      options: [
+        {
+          type: ApplicationCommandOptionType.String,
+          name: "class",
+          description: "Which class",
+          required: true,
+          choices: CLASS_CHOICES,
+        },
+      ],
+    },
+    {
+      type: ApplicationCommandOptionType.Subcommand,
+      name: "list",
+      description: "Show bindings, bot presence and slot holders",
+    },
+  ],
+};
+
 /**
  * Registers the commands globally (new guilds get them once Discord
  * propagates) and in every guild the bot is already in (appears instantly).
@@ -686,7 +1398,7 @@ async function registerCommands(client: Client): Promise<void> {
   const applicationId = client.user?.id;
   if (!applicationId) return;
 
-  const commands = [VERIFY_COMMAND, COUNTING_COMMAND];
+  const commands = [VERIFY_COMMAND, COUNTING_COMMAND, REVIEW_COMMAND, CLASS_SERVER_COMMAND];
 
   const globalRegistration = client.rest
     .put(Routes.applicationCommands(applicationId), { body: commands })

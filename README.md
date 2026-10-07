@@ -1,25 +1,39 @@
 # Year 7 Class Role Bot
 
 A Discord bot that asks for your school email, checks it against the class roster
-(`db.csv`) and — if it matches — gives you the Discord role for your class (7A–7R).
-It also runs a **counting channel** game: members post 1, 2, 3 … in order and a
-wrong number resets the count (the record survives).
+(`db.csv`) and — once an **admin approves the request manually** — gives you the
+Discord role for your class (7A–7R) in the main server and DMs you the invite to
+your **class's own server**. Each class has one server slot, and admin commands
+are gated by a single role instead of permission bits. It also runs a
+**counting channel** game: members post 1, 2, 3 … in order and a wrong number
+resets the count (the record survives).
 
 Runs on **Node.js ≥ 22.18** (TypeScript is executed natively via built-in type
 stripping — no bundler or transpiler involved).
 
 ## How it works
 
-1. A student runs `/verify` in the server.
-2. The bot opens a **private modal** asking for their school email — nothing is posted in chat.
-3. The email is normalized (lower-cased, spaces stripped) and looked up in the roster CSV.
-4. The Redis registry is checked: if another Discord user already claimed that address — or the
-   roster has no data for it — the bot replies that a user has already used it and a manual
-   review may be required, and grants nothing.
-5. On a free address the bot claims it in Redis, removes any other class role and adds the role
-   for that student's class (the claim is rolled back if the role grant fails).
-6. The reply is ephemeral, so only that student sees the result. Emails are never logged to the
-   console — they exist only in Redis as the claim registry.
+1. Admins set up each class's Discord server once: `/class-server set class:7A server:<id>`
+   (run anywhere — just the server ID) and invite the bot to that server.
+2. A student runs `/verify` in the **main server** and submits their school email
+   in a **private modal** — nothing is posted in chat.
+3. The email is normalized and looked up in the roster CSV. The request is refused
+   (with a clear reason) if the roster has no data for it, another user already
+   claimed it, the student already has a review in flight, someone else holds their
+   class's **server slot**, the class has no registered server, or the bot hasn't
+   been invited there yet.
+4. Otherwise the bot **claims the class's server slot** and parks a pending review —
+   nothing is granted automatically.
+5. An admin runs `/review list`, then `/review approve user:@student` (or
+   `/review deny`). Approval claims the email (`SET NX`), grants the class role in
+   the main server, and DMs the student an invite link to their class server.
+   Denial frees the slot and DMs the student the reason.
+6. The slot stays held after approval until an admin runs
+   `/review release class:7A` — one verified student per class at a time.
+   Re-running `/verify` after approval just re-grants the role instantly.
+
+All replies are ephemeral. Emails are never logged to the console — they exist
+only in Redis as the claim registry.
 
 ## Setup
 
@@ -57,15 +71,52 @@ is already in (those appear instantly; the global registration can take up to an
 2. **Server Settings → Roles**: drag the bot's role **above every class role (7A–7R)**.
    Discord will not let a bot edit roles that sit above its own highest role.
 
-### 4. Verify
+### 4. Grant the admin role
 
-Run `/verify`, type the school email, and the class role is applied.
+Create (or pick) a role with ID **`1557298773951123476`** and give it to the
+people who run reviews. Every admin command — `/review …`, `/class-server …`,
+`/counting setup`, `/counting reset` — checks for this role instead of Discord
+permission bits, so it replaces all previous permission requirements.
+
+### 5. Verify
+
+Run `/verify`, type the school email, wait for an admin's `/review approve`, and
+the class role plus the class-server invite arrive by DM.
+
+## Manual review & class servers
+
+| Command | Who | What it does |
+| --- | --- | --- |
+| `/class-server set class:7A server:<id> [invite:<url>]` | admin role | Binds a class to a Discord server. Runs from any server — only the target's ID is needed. Warns if the bot isn't in that server yet. |
+| `/class-server clear class:7A` | admin role | Removes the binding (reviews for that class are blocked). |
+| `/class-server list` | admin role | All bindings: server ID, whether the bot is present, who holds each slot. |
+| `/review list` | admin role | Pending requests: student, class, email, request time (Melbourne). |
+| `/review approve user:@student` | admin role | Grants the class role in the main server, DMs the class-server invite, keeps the slot held. Rolls the email claim back if the role grant fails. |
+| `/review deny user:@student [reason]` | admin role | Removes the request, frees the slot, DMs the student. |
+| `/review release class:7A` | admin role | Frees a held slot so the next student of that class can request a review. |
+
+Rules:
+
+- Verification always happens in the **main server**; the class servers are only
+  joined after approval (the invite comes by DM).
+- One **slot per class**: a review claims it, approval keeps it, denial or
+  `/review release` frees it. The bot won't accept a second request for a class
+  while its slot is held.
+- The bot must be **invited to the class server before** the review is requested,
+  and the class must be registered with `/class-server set` first.
+- The invite DM uses the stored `invite:` link if present; otherwise the bot
+  creates a fresh invite on approval (the class server needs **Create Instant
+  Invite** for that). If the student has DMs closed, the invite is shown to the
+  approving admin instead.
+- A student can never be pending twice or hold two servers — their claim binds
+  them to their own class's server only.
 
 ## Configuration
 
 | What | Where |
 | --- | --- |
 | Class → role ID mapping (7A–7R) | `src/roles.ts` |
+| Admin role (gates every admin command) | `ADMIN_ROLE_ID` in `src/roles.ts` (`1557298773951123476`) |
 | Student roster | `db.csv` (columns: First Name, Last Name, Gender, Class, Email Address, School, Year) |
 | Roster path override | `ROSTER_CSV` env var |
 | Claim registry | Redis at `redis://red-db2m8kvavr4c73ejq3g0:6379` (override: `REDIS_URL` env var) |
@@ -96,6 +147,9 @@ overridable with the `REDIS_URL` environment variable:
 | `classbot:verify:user:<userId>` | the email that user claimed (reverse index for review) |
 | `classbot:counting:channel:<guildId>` | the guild's counting channel ID |
 | `classbot:counting:state:<guildId>` | JSON `{count, record}` — current count and record |
+| `classbot:verify:pending:<userId>` | JSON pending review `{userId, userTag, email, className, guildId, requestedAt}` |
+| `classbot:verify:slot:<className>` | the userId holding that class's server slot (`SET NX`) |
+| `classbot:classserver:<className>` | JSON `{guildId, invite, setAt}` — the class's registered server |
 
 Claims are permanent and conflict-free by construction (`SET NX`): a second user submitting
 the same address is told a user already used it and that manual review may be required. The
@@ -127,9 +181,9 @@ Members count up together in one channel: **1, 2, 3 …**
 
 | Command | Who | What it does |
 | --- | --- | --- |
-| `/counting setup channel:#counting` | Manage Server | Picks the channel where members count. |
+| `/counting setup channel:#counting` | admin role | Picks the channel where members count. |
 | `/counting status` | anyone | Shows the current count, the next number and the record (ephemeral). |
-| `/counting reset` | Manage Server | Starts over at 1 — the record is kept. |
+| `/counting reset` | admin role | Starts over at 1 — the record is kept. |
 
 Rules the bot enforces:
 
@@ -163,3 +217,7 @@ Messages lets it delete wrong numbers.
 | Counting resets after every restart | Redis is unreachable (`"redis":"error"`), so the count only lives in memory. Fix `REDIS_URL` connectivity to persist it. |
 | `/verify` not listed | Wait for global command propagation (up to an hour) or re-invite; the bot re-registers on every start. |
 | "couldn't find ... on the class list" | Check the address against the roster CSV — matching is case-insensitive, domain included. |
+| "you need the 1557298773951123476 role" | Give your admin role that ID (or change `ADMIN_ROLE_ID` in `src/roles.ts`), then restart. |
+| "Someone already holds the … server slot" | The class already has a student in review/approved — run `/review release class:<name>` to free it. |
+| "I don't have a server registered for …" / "I'm not in the … server" | Run `/class-server set` with the class server's ID and invite the bot to that server, then retry `/verify`. |
+| Approval says "couldn't DM them" | The student has DMs closed — relay the invite shown in the admin reply manually. |
