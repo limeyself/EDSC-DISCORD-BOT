@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
+  countingChannelKey,
+  countingStateKey,
   decideVerification,
   emailKey,
   userKey,
@@ -45,6 +47,22 @@ describe("redis key namespacing", () => {
     assert.notEqual(email, user);
     assert.ok(email.startsWith("classbot:verify:email:"));
     assert.ok(user.startsWith("classbot:verify:user:"));
+  });
+});
+
+describe("counting key namespacing", () => {
+  test("counting keys are namespaced under classbot:counting", () => {
+    assert.equal(
+      countingChannelKey("111"),
+      "classbot:counting:channel:111",
+    );
+    assert.equal(countingStateKey("111"), "classbot:counting:state:111");
+  });
+
+  test("channel and state key spaces cannot collide", () => {
+    assert.notEqual(countingChannelKey("g"), countingStateKey("g"));
+    // …and cannot collide with the verification registry either.
+    assert.ok(!countingChannelKey("g").startsWith("classbot:verify:"));
   });
 });
 

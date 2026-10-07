@@ -1,4 +1,5 @@
 import { createClient } from "redis";
+import { isCountingState, type CountingState } from "./counting.ts";
 
 /**
  * Default connection supplied by the server admins. Override with the
@@ -19,6 +20,8 @@ export type StoreStatus = "connecting" | "ready" | "error";
 
 const EMAIL_PREFIX = "classbot:verify:email:";
 const USER_PREFIX = "classbot:verify:user:";
+const COUNTING_CHANNEL_PREFIX = "classbot:counting:channel:";
+const COUNTING_STATE_PREFIX = "classbot:counting:state:";
 
 export function emailKey(email: string): string {
   return `${EMAIL_PREFIX}${email}`;
@@ -26,6 +29,14 @@ export function emailKey(email: string): string {
 
 export function userKey(userId: string): string {
   return `${USER_PREFIX}${userId}`;
+}
+
+export function countingChannelKey(guildId: string): string {
+  return `${COUNTING_CHANNEL_PREFIX}${guildId}`;
+}
+
+export function countingStateKey(guildId: string): string {
+  return `${COUNTING_STATE_PREFIX}${guildId}`;
 }
 
 export type VerificationDecision =
@@ -162,6 +173,32 @@ export class VerifyStore {
       if (records.length >= 1000) break;
     }
     return records;
+  }
+
+  /** Which channel this guild counts in, or null if none is configured. */
+  async getCountingChannel(guildId: string): Promise<string | null> {
+    const raw = await this.client.get(countingChannelKey(guildId));
+    return raw || null;
+  }
+
+  async setCountingChannel(guildId: string, channelId: string): Promise<void> {
+    await this.client.set(countingChannelKey(guildId), channelId);
+  }
+
+  /** Saved counting progress; null when unset or unreadable. */
+  async getCountingState(guildId: string): Promise<CountingState | null> {
+    const raw = await this.client.get(countingStateKey(guildId));
+    if (!raw) return null;
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      return isCountingState(parsed) ? parsed : null;
+    } catch {
+      return null; // Corrupt value: start the count from scratch.
+    }
+  }
+
+  async setCountingState(guildId: string, state: CountingState): Promise<void> {
+    await this.client.set(countingStateKey(guildId), JSON.stringify(state));
   }
 
   async close(): Promise<void> {

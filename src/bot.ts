@@ -1,18 +1,29 @@
 import {
   ActionRowBuilder,
+  ApplicationCommandOptionType,
+  ChannelType,
   Client,
   Events,
   GatewayIntentBits,
   GuildMember,
   MessageFlags,
   ModalBuilder,
+  PermissionFlagsBits,
   Routes,
   TextInputBuilder,
   TextInputStyle,
   type ChatInputCommandInteraction,
   type Interaction,
+  type Message,
   type ModalSubmitInteraction,
 } from "discord.js";
+import {
+  evaluateCountingMessage,
+  expectedNumber,
+  initialCountingState,
+  resetCounting,
+  type CountingState,
+} from "./counting.ts";
 import { startHealthServer } from "./health.ts";
 import { loadRoster, rosterPath } from "./roster.ts";
 import { SECTION_ROLE_IDS } from "./roles.ts";
@@ -65,6 +76,14 @@ void store.start();
 
 const lastAttemptByUser = new Map<string, number>();
 
+/**
+ * Counting channel cache per guild. Maps hold "" for "no channel configured"
+ * so busy servers don't hammer Redis on every message; setup overwrites it.
+ */
+const countingChannelByGuild = new Map<string, string>();
+const countingStateByGuild = new Map<string, CountingState>();
+let warnedMissingContentIntent = false;
+
 const token = process.env.DISCORD_BOT_TOKEN?.trim();
 
 if (!token) {
@@ -76,12 +95,25 @@ if (!token) {
   void startBot(token).catch((error) => {
     state.gateway = "error";
     state.detail = error instanceof Error ? error.message : String(error);
+    if (/intent/i.test(state.detail)) {
+      state.detail +=
+        " — enable the Message Content Intent in the Developer Portal (Bot → Privileged Gateway Intents), or set DISABLE_MESSAGE_CONTENT_INTENT=1 to run without counting.";
+    }
     console.error(`[bot] failed to start: ${state.detail}`);
   });
 }
 
 async function startBot(botToken: string): Promise<void> {
-  const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+  // GuildMessages + Message Content let the bot read the counting channel.
+  // Message Content is privileged: it must be toggled ON in the Developer
+  // Portal or the gateway is refused with close code 4014 — set
+  // DISABLE_MESSAGE_CONTENT_INTENT=1 to boot without it (counting stays inert,
+  // /verify still works).
+  const intents = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages];
+  if (!process.env.DISABLE_MESSAGE_CONTENT_INTENT) {
+    intents.push(GatewayIntentBits.MessageContent);
+  }
+  const client = new Client({ intents });
 
   client.on(Events.Error, (error) => {
     console.error(`[bot] gateway error: ${error.message}`);
@@ -105,7 +137,7 @@ async function startBot(botToken: string): Promise<void> {
 
     console.log(`[bot] ready as ${ready.user.tag}`);
     console.log(`[bot] invite URL: ${inviteUrl(ready.user.id)}`);
-    void registerVerifyCommand(client);
+    void registerCommands(client);
   });
 
   client.on(Events.InteractionCreate, (interaction) => {
@@ -117,12 +149,25 @@ async function startBot(botToken: string): Promise<void> {
     });
   });
 
+  client.on(Events.MessageCreate, (message) => {
+    void handleCountingMessage(message).catch((error) => {
+      console.error(
+        `[counting] could not handle message: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    });
+  });
+
   await client.login(botToken);
 }
 
 async function handleInteraction(interaction: Interaction): Promise<void> {
   if (interaction.isChatInputCommand()) {
     if (interaction.commandName === "verify") await handleVerifyCommand(interaction);
+    else if (interaction.commandName === "counting") {
+      await handleCountingCommand(interaction);
+    }
     return;
   }
 
@@ -201,6 +246,214 @@ async function handleVerifyModal(interaction: ModalSubmitInteraction): Promise<v
         result.roleId,
       );
       return;
+  }
+}
+
+/**
+ * Counting channel: validates each message against the current count,
+ * advances on the right number and resets (with an explanation) on a wrong one.
+ */
+async function handleCountingMessage(message: Message): Promise<void> {
+  if (message.author.bot || !message.guildId) return;
+
+  const guildId = message.guildId;
+  const channelId = await resolveCountingChannel(guildId);
+  if (!channelId || channelId !== message.channelId) return;
+
+  // Message Content is privileged — without it every message body arrives
+  // empty and counting can't work at all. Say so once instead of staying silent.
+  if (
+    !warnedMissingContentIntent &&
+    message.content === "" &&
+    message.embeds.length === 0 &&
+    message.attachments.size === 0
+  ) {
+    warnedMissingContentIntent = true;
+    console.warn(
+      "[counting] messages arrive with empty content — enable the Message Content Intent in the Developer Portal (Bot → Privileged Gateway Intents), then restart the preview.",
+    );
+  }
+
+  const state = await resolveCountingState(guildId);
+  const outcome = evaluateCountingMessage(state, {
+    content: message.content,
+    authorIsBot: message.author.bot,
+  });
+  if (outcome.kind === "ignore") return;
+
+  countingStateByGuild.set(guildId, outcome.next);
+  persistCountingState(guildId, outcome.next);
+  if (outcome.kind === "correct") return;
+
+  // Wrong number: delete it if we can (Manage Messages), then explain the reset.
+  await message.delete().catch(() => undefined);
+  const recordNote =
+    outcome.next.record > 0
+      ? ` The record of **${outcome.next.record}** still stands.`
+      : "";
+  if ("send" in message.channel) {
+    await message.channel
+      .send(
+        `**${outcome.value}** isn't it — I expected **${outcome.expected}**. The count is back to **1**.${recordNote}`,
+      )
+      .catch(() => undefined);
+  }
+}
+
+/** Channel config for a guild: memory first, then Redis (once it's up). */
+async function resolveCountingChannel(guildId: string): Promise<string | null> {
+  const cached = countingChannelByGuild.get(guildId);
+  if (cached !== undefined) return cached || null;
+  // Don't queue reads behind a store that is down — try again once it's back.
+  if (store.statusInfo().status !== "ready") return null;
+  try {
+    const channelId = await store.getCountingChannel(guildId);
+    countingChannelByGuild.set(guildId, channelId ?? "");
+    return channelId;
+  } catch {
+    return null;
+  }
+}
+
+/** Counting progress: memory first, then Redis (once it's up). */
+async function resolveCountingState(guildId: string): Promise<CountingState> {
+  const cached = countingStateByGuild.get(guildId);
+  if (cached) return cached;
+  const fallback = initialCountingState();
+  // Uncached and the store is down: use a scratch state but don't cache it,
+  // so a restart with a healthy store still loads the real saved count.
+  if (store.statusInfo().status !== "ready") return fallback;
+  try {
+    const loaded = (await store.getCountingState(guildId)) ?? fallback;
+    countingStateByGuild.set(guildId, loaded);
+    return loaded;
+  } catch {
+    countingStateByGuild.set(guildId, fallback);
+    return fallback;
+  }
+}
+
+/** Write-through to Redis; the in-memory count keeps working if the store is down. */
+function persistCountingState(guildId: string, counting: CountingState): void {
+  if (store.statusInfo().status !== "ready") return;
+  void store.setCountingState(guildId, counting).catch(() => {
+    // The Redis client already logs outages; memory stays authoritative and
+    // the next message writes the full state again anyway.
+  });
+}
+
+function canManageCounting(interaction: ChatInputCommandInteraction): boolean {
+  return interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild) ?? false;
+}
+
+async function handleCountingCommand(
+  interaction: ChatInputCommandInteraction,
+): Promise<void> {
+  if (!interaction.inGuild() || !interaction.guild) {
+    await interaction.reply({
+      content: "Please run `/counting` inside the server.",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const guildId = interaction.guild.id;
+  const subcommand = interaction.options.getSubcommand();
+
+  if (subcommand === "setup") {
+    if (!canManageCounting(interaction)) {
+      await interaction.reply({
+        content: "You need the **Manage Server** permission to pick the counting channel.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    const channel = interaction.options.getChannel("channel", true);
+    if (channel.type !== ChannelType.GuildText) {
+      await interaction.reply({
+        content: "Pick a normal text channel for counting.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    const me =
+      interaction.guild.members.me ?? (await interaction.guild.members.fetchMe());
+    if ("permissionsFor" in channel && !channel.permissionsFor(me)?.has(PermissionFlagsBits.SendMessages)) {
+      await interaction.reply({
+        content: `I can't send messages in <#${channel.id}> — give me **Send Messages** there first.`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    countingChannelByGuild.set(guildId, channel.id);
+    countingStateByGuild.delete(guildId); // a new channel starts from scratch
+
+    let persisted = false;
+    if (store.statusInfo().status === "ready") {
+      try {
+        await store.setCountingChannel(guildId, channel.id);
+        persisted = true;
+      } catch {
+        persisted = false;
+      }
+    }
+    const note = persisted
+      ? ""
+      : " ⚠️ I can't reach the verification store, so this only lasts until a restart.";
+    await interaction.reply({
+      content: `Counting channel set to <#${channel.id}> — post **1**, **2**, **3** … in order. Get one wrong and the count starts over.${note}`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  if (subcommand === "status") {
+    const channelId = await resolveCountingChannel(guildId);
+    if (!channelId) {
+      await interaction.reply({
+        content: "No counting channel yet — an admin can run `/counting setup`.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    if (!interaction.guild.channels.cache.has(channelId)) {
+      await interaction.reply({
+        content: "The counting channel has been deleted — run `/counting setup` again.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const counting = await resolveCountingState(guildId);
+    const recordLine =
+      counting.record > 0 ? ` · record **${counting.record}**` : "";
+    await interaction.reply({
+      content: `<#${channelId}> is at **${counting.count}** — next up is **${expectedNumber(counting)}**${recordLine}.`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  if (subcommand === "reset") {
+    if (!canManageCounting(interaction)) {
+      await interaction.reply({
+        content: "You need the **Manage Server** permission to reset the count.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const counting = await resolveCountingState(guildId);
+    const next = resetCounting(counting);
+    countingStateByGuild.set(guildId, next);
+    persistCountingState(guildId, next);
+    const recordLine =
+      counting.record > 0 ? ` The record of **${counting.record}** stays.` : "";
+    await interaction.reply({
+      content: `Count reset — start again at **1**.${recordLine}`,
+      flags: MessageFlags.Ephemeral,
+    });
   }
 }
 
@@ -393,26 +646,62 @@ export const VERIFY_COMMAND = {
   dm_permission: false,
 } as const;
 
+export const COUNTING_COMMAND = {
+  name: "counting",
+  description: "Count up together in a channel — get one wrong and it resets",
+  dm_permission: false,
+  options: [
+    {
+      type: ApplicationCommandOptionType.Subcommand,
+      name: "setup",
+      description: "Choose the channel where members count",
+      options: [
+        {
+          type: ApplicationCommandOptionType.Channel,
+          name: "channel",
+          description: "The counting channel",
+          channel_types: [ChannelType.GuildText],
+          required: true,
+        },
+      ],
+    },
+    {
+      type: ApplicationCommandOptionType.Subcommand,
+      name: "status",
+      description: "Show the current count, the next number and the record",
+    },
+    {
+      type: ApplicationCommandOptionType.Subcommand,
+      name: "reset",
+      description: "Reset the count back to 1 (keeps the record)",
+    },
+  ],
+};
+
 /**
- * Registers /verify globally (new guilds get it once Discord propagates) and
- * in every guild the bot is already in (appears instantly).
+ * Registers the commands globally (new guilds get them once Discord
+ * propagates) and in every guild the bot is already in (appears instantly).
  */
-async function registerVerifyCommand(client: Client): Promise<void> {
+async function registerCommands(client: Client): Promise<void> {
   const applicationId = client.user?.id;
   if (!applicationId) return;
 
+  const commands = [VERIFY_COMMAND, COUNTING_COMMAND];
+
   const globalRegistration = client.rest
-    .put(Routes.applicationCommands(applicationId), { body: [VERIFY_COMMAND] })
+    .put(Routes.applicationCommands(applicationId), { body: commands })
     .then(() =>
-      console.log("[bot] registered global /verify (can take up to an hour to appear)"),
+      console.log(
+        "[bot] registered global /verify and /counting (can take up to an hour to appear)",
+      ),
     );
 
   const guildRegistrations = client.guilds.cache.map((guild) =>
     client.rest
       .put(Routes.applicationGuildCommands(applicationId, guild.id), {
-        body: [VERIFY_COMMAND],
+        body: commands,
       })
-      .then(() => console.log(`[bot] registered /verify in ${guild.name}`)),
+      .then(() => console.log(`[bot] registered /verify and /counting in ${guild.name}`)),
   );
 
   const registrations = [globalRegistration, ...guildRegistrations];
@@ -421,7 +710,7 @@ async function registerVerifyCommand(client: Client): Promise<void> {
   for (const result of results) {
     if (result.status === "rejected") {
       console.error(
-        `[bot] could not register /verify: ${
+        `[bot] could not register commands: ${
           result.reason instanceof Error ? result.reason.message : String(result.reason)
         }`,
       );
@@ -431,8 +720,8 @@ async function registerVerifyCommand(client: Client): Promise<void> {
 
 /** Ready-to-paste invite link with the permissions this bot needs. */
 function inviteUrl(applicationId: string): string {
-  // View Channel (1024) + Send Messages (2048) + Read Message History (65536) + Manage Roles (268435456)
-  const permissions = 1024 + 2048 + 65536 + 268435456;
+  // View Channel (1024) + Send Messages (2048) + Read Message History (65536) + Manage Messages (131072) + Manage Roles (268435456)
+  const permissions = 1024 + 2048 + 65536 + 131072 + 268435456;
   const params = new URLSearchParams({
     client_id: applicationId,
     permissions: String(permissions),
