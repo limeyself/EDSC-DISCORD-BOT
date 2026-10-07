@@ -1815,7 +1815,9 @@ export const CLASS_SERVER_COMMAND = {
 
 /**
  * Registers the commands globally (new guilds get them once Discord
- * propagates) and in every guild the bot is already in (appears instantly).
+ * Propagates everywhere (up to an hour for brand-new servers) and clears the
+ * stale per-guild copies older versions created, fixing the duplicated
+ * entries in the slash-command picker.
  */
 async function registerCommands(client: Client): Promise<void> {
   const applicationId = client.user?.id;
@@ -1830,25 +1832,20 @@ async function registerCommands(client: Client): Promise<void> {
     SERVER_REQUEST_COMMAND,
   ];
 
-  const globalRegistration = client.rest
-    .put(Routes.applicationCommands(applicationId), { body: commands })
-    .then(() =>
-      console.log(
-        "[bot] registered global /verify and /counting (can take up to an hour to appear)",
-      ),
-    );
+  // Single source of truth: register only GLOBALLY. Registering per-guild as
+  // well makes Discord list every command twice (one from each scope) — that
+  // was the duplicated /class-server & co. in the command picker.
+  const results = await Promise.allSettled([
+    client.rest.put(Routes.applicationCommands(applicationId), { body: commands }),
+    // Sweep any guild-scoped copies left behind by earlier versions so each
+    // command appears exactly once again.
+    ...client.guilds.cache.map((guild) =>
+      client.rest.put(Routes.applicationGuildCommands(applicationId, guild.id), {
+        body: [],
+      }),
+    ),
+  ]);
 
-  const guildRegistrations = client.guilds.cache.map((guild) =>
-    client.rest
-      .put(Routes.applicationGuildCommands(applicationId, guild.id), {
-        body: commands,
-      })
-      .then(() => console.log(`[bot] registered /verify and /counting in ${guild.name}`)),
-  );
-
-  const registrations = [globalRegistration, ...guildRegistrations];
-
-  const results = await Promise.allSettled(registrations);
   for (const result of results) {
     if (result.status === "rejected") {
       console.error(
@@ -1857,6 +1854,12 @@ async function registerCommands(client: Client): Promise<void> {
         }`,
       );
     }
+  }
+
+  if (results.every((r) => r.status === "fulfilled")) {
+    console.log(
+      `[bot] registered ${commands.length} global commands and cleared guild-scoped copies`,
+    );
   }
 }
 

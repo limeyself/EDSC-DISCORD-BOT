@@ -66,8 +66,10 @@ freebuff-preview start
 freebuff-preview logs
 ```
 
-On startup the bot prints its **invite URL** and registers `/verify` in every server it
-is already in (those appear instantly; the global registration can take up to an hour).
+On startup the bot prints its **invite URL** and registers every command once, **globally**
+(propagation can take up to an hour; a client restart shows new servers sooner). It also
+wipes any per-server copies left by older versions — that's what made commands like
+`/class-server` appear **twice** in the picker.
 
 ### 3. Invite it and fix the role order
 
@@ -239,6 +241,7 @@ Messages lets it delete wrong numbers.
 | Counting channel: nothing happens / logs say messages arrive with empty content | The Message Content Intent is off in the portal. Enable it and `freebuff-preview restart`. |
 | Counting resets after every restart | Redis is unreachable (`"redis":"error"`), so the count only lives in memory. Fix `REDIS_URL` connectivity to persist it. |
 | `/verify` not listed | Wait for global command propagation (up to an hour) or re-invite; the bot re-registers on every start. |
+| Commands each show up twice in the picker | Fixed: the bot now registers globally only and removes old per-server copies on every start. Restart the preview once and let Discord refresh. |
 | "couldn't find ... on the class list" | Check the address against the roster CSV — matching is case-insensitive, domain included. |
 | "you need the 1557298773951123476 role" | Give your admin role that ID (or change `ADMIN_ROLE_ID` in `src/roles.ts`), then restart. |
 | "Someone already holds the … server slot" | The class already has a student in review/approved — run `/review release class:<name>` to free it. |
